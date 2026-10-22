@@ -13,11 +13,14 @@ which is included as part of this source code package.
 #include "visual_point.h"
 #include "feature.h"
 #include <stdexcept>
+#include <atomic>
 #include <vikit/math_utils.h>
 
+namespace { std::atomic<std::uint64_t> next_backend_track_id{1}; }
+
 VisualPoint::VisualPoint(const Vector3d &pos)
-    : pos_(pos), previous_normal_(Vector3d::Zero()), normal_(Vector3d::Zero()),
-      is_converged_(false), is_normal_initialized_(false), has_ref_patch_(false),
+    : backend_track_id_(next_backend_track_id.fetch_add(1)), pos_(pos), previous_normal_(Vector3d::Zero()), normal_(Vector3d::Zero()),
+      is_converged_(false), is_normal_initialized_(false), has_ref_patch_(false), ref_patch(nullptr),
       has_lidar_anchor_(false), source_lidar_time_(-1.0),
       source_lidar_point_(Vector3d::Zero())
 {

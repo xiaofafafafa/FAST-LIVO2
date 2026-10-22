@@ -14,6 +14,7 @@ which is included as part of this source code package.
 #define LIVO_POINT_H_
 
 #include <boost/noncopyable.hpp>
+#include <cstdint>
 #include "common_lib.h"
 #include "frame.h"
 
@@ -25,6 +26,7 @@ class VisualPoint : boost::noncopyable
 public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
+  const std::uint64_t backend_track_id_; //!< Never reused, even if a point is deleted.
   Vector3d pos_;                //!< 3d pos of the point in the world coordinate frame.
   Vector3d normal_;             //!< Surface normal at point.
   Matrix3d normal_information_; //!< Inverse covariance matrix of normal estimation.

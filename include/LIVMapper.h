@@ -34,6 +34,7 @@ public:
   void gravityAlignment();
   void handleFirstFrame();
   void stateEstimationAndMapping();
+  std::deque<sensor_msgs::Imu::ConstPtr> backendImuMeasurements(double timestamp);
   void handleVIO();
   void handleLIO();
   void savePCD();

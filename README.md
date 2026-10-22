@@ -1,11 +1,14 @@
 # FAST-LIVO2
 
 > This workspace also contains an optional information-driven adaptive
-> fixed-lag backend under `include/adaptive_window/` and
+> **Ceres 2.1+** fixed-lag backend under `include/adaptive_window/` and
 > `src/adaptive_window/`. See
 > [`docs/ADAPTIVE_WINDOW_INTEGRATION.md`](docs/ADAPTIVE_WINDOW_INTEGRATION.md)
 > and launch it with `mapping_avia_adaptive.launch`. The original launch files
 > remain unchanged and the extension is disabled unless its YAML is loaded.
+> This research branch has **not yet been compiled or dataset-validated**.
+> It runs in shadow mode (no state/covariance/map feedback). Start with the
+> standalone tests in the integration guide before running ROS datasets.
 
 ## FAST-LIVO2: Fast, Direct LiDAR-Inertial-Visual Odometry
 

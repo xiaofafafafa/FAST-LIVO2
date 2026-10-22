@@ -2,13 +2,20 @@
 # Start with feedback_enabled=false and validate the parallel odometry topic.
 adaptive_window:
   enabled: true
-  feedback_enabled: false
+  feedback_enabled: false  # shadow mode enforced; covariance transfer is not implemented
+  optimize_extrinsics: false  # opt in only after excitation/observability tests
 
   min_window_size: 4
   max_window_size: 12
   initial_window_size: 6
   max_lidar_factors: 160
-  max_cross_modal_factors: 80
+  max_cross_modal_factors: 80  # admitted patch observations per image
+  max_active_patches: 160
+  plane_search_radius: 0.75
+  plane_max_rms: 0.05
+  cross_modal_plane_sigma: 0.05
+  min_inverse_depth: 0.005
+  max_inverse_depth: 5.0
 
   # Frames retain their native timestamps. Association is nearest-neighbour
   # with an uncertainty weight; equality of timestamps is never required.
@@ -33,20 +40,24 @@ adaptive_window:
   lidar_rmse_scale: 0.08
   vision_rmse_scale: 20.0
 
-  solver_damping: 0.000001
-  solver_iterations: 3
+  solver_time_limit: 0.03
+  solver_iterations: 8
   huber_delta_lidar: 2.0
+  huber_delta_vision: 3.0
   huber_delta_cross_modal: 3.0
 
   pose_prior_translation_sigma: 0.08
   pose_prior_rotation_deg: 3.0
+  velocity_prior_sigma: 0.30
+  bias_prior_sigma: 0.05
   extrinsic_translation_sigma: 0.05
   extrinsic_rotation_deg: 3.0
 
+  # VINS-style discrete noise stddevs (not continuous-time noise densities).
+  imu_max_gap: 0.05
+  imu_repropagate_acc_bias: 0.05
+  imu_repropagate_gyr_bias: 0.005
   imu_acc_noise: 0.10
   imu_gyr_noise: 0.01
   imu_acc_bias_rw: 0.001
   imu_gyr_bias_rw: 0.0001
-
-  feedback_max_translation: 0.10
-  feedback_max_rotation_deg: 2.0

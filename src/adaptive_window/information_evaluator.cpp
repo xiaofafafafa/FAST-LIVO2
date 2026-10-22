@@ -26,6 +26,12 @@ MeasurementSummary InformationEvaluator::Evaluate(
     const MeasurementSummary &measurement)
 {
   MeasurementSummary result = measurement;
+  if (!measurement.information.allFinite() || !std::isfinite(measurement.inlier_ratio))
+  {
+    result.valid = false;
+    result.normalized_information = result.reliability = 0.0;
+    return result;
+  }
   const auto symmetric = 0.5 * (measurement.information +
                                 measurement.information.transpose());
   Eigen::SelfAdjointEigenSolver<

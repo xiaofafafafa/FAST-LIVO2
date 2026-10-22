@@ -43,13 +43,9 @@ public:
       const std::deque<sensor_msgs::Imu::ConstPtr> &imu_messages,
       double acceleration_scale);
 
-  bool ApplyStateFeedback(double timestamp, StatesGroup *state) const;
-  bool ApplyExtrinsicFeedback(const VIOManagerPtr &vio_manager) const;
-
 private:
   static AdaptiveWindowConfig LoadConfig(ros::NodeHandle &node_handle);
   static NavState ToNavState(double timestamp, const StatesGroup &state);
-  static void CopyToFastLivoState(const NavState &input, StatesGroup *output);
 
   MeasurementSummary BuildLidarSummary(
       double timestamp, const StatesGroup &state,
@@ -58,7 +54,7 @@ private:
       LidarPlaneObservationVector *observations) const;
   MeasurementSummary BuildVisionSummary(
       double timestamp, const VIOManagerPtr &vio_manager,
-      CrossModalObservationVector *observations) const;
+      VisualPatchObservationVector *observations) const;
   void Publish(double timestamp) const;
 
   AdaptiveWindowConfig config_;

@@ -95,28 +95,21 @@ struct LidarPlaneObservation
   double variance = 1.0e-3;
 };
 
-struct CrossModalObservation
+// Raw patch sampled in the CURRENT image. The backend retains its own reference
+// patch at an admitted keyframe, never a frontend-prewarped patch.
+struct VisualPatchObservation
 {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-
-  double lidar_timestamp = -1.0;
-  double image_timestamp = -1.0;
-  Eigen::Vector3d point_l = Eigen::Vector3d::Zero();
-  Eigen::Vector2d pixel = Eigen::Vector2d::Zero();
-  double pixel_sigma = 1.5;
+  std::uint64_t track_id = 0;
+  Eigen::Vector3d point_w = Eigen::Vector3d::Zero(); // initialization only
+  Eigen::Vector3d center_ray = Eigen::Vector3d::UnitZ(); // z = 1
+  Eigen::Vector3d normal_c = Eigen::Vector3d::UnitZ(); // fixed patch tangent
+  double inverse_depth = 1.0;
   double tracking_score = 1.0;
-  std::vector<Eigen::Vector2d, Eigen::aligned_allocator<Eigen::Vector2d>>
-      patch_offsets;
-  std::vector<double> reference_intensities;
-  double reference_inverse_exposure = 1.0;
-  double current_inverse_exposure = 1.0;
+  std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> rays;
+  std::vector<double> intensities;
+  double inverse_exposure = 1.0;
   double photometric_sigma = 10.0;
-
-  bool has_photometric_patch() const
-  {
-    return !patch_offsets.empty() &&
-           patch_offsets.size() == reference_intensities.size();
-  }
 };
 
 struct MeasurementSummary
@@ -164,6 +157,7 @@ struct AdaptiveWindowConfig
   int initial_window_size = 6;
   int max_lidar_factors = 160;
   int max_cross_modal_factors = 80;
+  int max_active_patches = 160;
 
   double merge_time_tolerance = 1.0e-4;
   double association_max_dt = 0.08;
@@ -188,10 +182,17 @@ struct AdaptiveWindowConfig
   double information_logdet_ceiling = 30.0;
   double degeneracy_eigen_threshold = 1.0e-4;
 
-  double solver_damping = 1.0e-6;
-  int solver_iterations = 3;
+  int solver_iterations = 8;
+  double solver_time_limit = 0.03; // seconds; a soft Ceres budget
   double huber_delta_lidar = 2.0;
+  double huber_delta_vision = 3.0;
   double huber_delta_cross_modal = 3.0;
+  bool optimize_extrinsics = false; // enable only with sufficient excitation
+  double plane_search_radius = 0.75;
+  double plane_max_rms = 0.05;
+  double cross_modal_plane_sigma = 0.05;
+  double min_inverse_depth = 0.005;
+  double max_inverse_depth = 5.0;
 
   double pose_prior_translation_sigma = 0.08;
   double pose_prior_rotation_deg = 3.0;
@@ -200,14 +201,13 @@ struct AdaptiveWindowConfig
   double extrinsic_translation_sigma = 0.05;
   double extrinsic_rotation_deg = 3.0;
 
-  double imu_acceleration_scale = 1.0;
   double imu_acc_noise = 0.10;
   double imu_gyr_noise = 0.01;
   double imu_acc_bias_rw = 0.001;
   double imu_gyr_bias_rw = 0.0001;
-
-  double feedback_max_translation = 0.10;
-  double feedback_max_rotation_deg = 2.0;
+  double imu_max_gap = 0.05;
+  double imu_repropagate_acc_bias = 0.05;
+  double imu_repropagate_gyr_bias = 0.005;
 };
 
 struct BackendDiagnostics
@@ -221,6 +221,11 @@ struct BackendDiagnostics
   bool solve_success = false;
   std::uint64_t last_marginalized_id = 0;
   std::size_t cross_modal_pairs = 0;
+  std::size_t lidar_factors = 0;
+  std::size_t vision_factors = 0;
+  std::size_t imu_factors = 0;
+  std::size_t rejected_imu_intervals = 0;
+  std::size_t reset_count = 0;
   double camera_extrinsic_translation_change = 0.0;
   double camera_extrinsic_rotation_change_deg = 0.0;
 };
@@ -232,9 +237,9 @@ using ImuSampleVector =
 using LidarPlaneObservationVector =
     std::vector<LidarPlaneObservation,
                 Eigen::aligned_allocator<LidarPlaneObservation>>;
-using CrossModalObservationVector =
-    std::vector<CrossModalObservation,
-                Eigen::aligned_allocator<CrossModalObservation>>;
+using VisualPatchObservationVector =
+    std::vector<VisualPatchObservation,
+                Eigen::aligned_allocator<VisualPatchObservation>>;
 
 }  // namespace adaptive_window
 }  // namespace fast_livo

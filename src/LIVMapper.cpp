@@ -283,6 +283,21 @@ void LIVMapper::stateEstimationAndMapping()
   }
 }
 
+std::deque<sensor_msgs::Imu::ConstPtr> LIVMapper::backendImuMeasurements(double timestamp)
+{
+  auto samples = LidarMeasures.measures.back().imu;
+  std::lock_guard<std::mutex> lock(mtx_buffer);
+  for (const auto &sample : imu_buffer)
+  {
+    if (sample && sample->header.stamp.toSec() >= timestamp)
+    {
+      samples.push_back(sample); // Read-only lookahead; leave frontend queue intact.
+      break;
+    }
+  }
+  return samples;
+}
+
 void LIVMapper::handleVIO() 
 {
   euler_cur = RotMtoEuler(_state.rot_end);
@@ -318,8 +333,7 @@ void LIVMapper::handleVIO()
             : 1.0;
     adaptive_window_bridge->ProcessVision(
         image_timestamp, _state, vio_manager,
-        LidarMeasures.measures.back().imu, acceleration_scale);
-    adaptive_window_bridge->ApplyExtrinsicFeedback(vio_manager);
+        backendImuMeasurements(image_timestamp), acceleration_scale);
   }
 
   if (imu_prop_enable) 
@@ -400,11 +414,8 @@ void LIVMapper::handleLIO()
             : 1.0;
     adaptive_window_bridge->ProcessLidar(
         lidar_update_timestamp, _state,
-        LidarMeasures.measures.back().imu, acceleration_scale,
+        backendImuMeasurements(lidar_update_timestamp), acceleration_scale,
         voxelmap_manager->ptpl_list_, feats_down_size);
-    if (adaptive_window_bridge->ApplyStateFeedback(lidar_update_timestamp,
-                                                   &_state))
-      voxelmap_manager->state_ = _state;
   }
 
   double t2 = omp_get_wtime();

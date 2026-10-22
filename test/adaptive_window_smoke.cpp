@@ -1,231 +1,264 @@
 #include "adaptive_window/adaptive_window_backend.h"
-#include "adaptive_window/math_utils.h"
-
-#include <Eigen/Core>
-
-#include <cassert>
-#include <cmath>
 #include <iostream>
+#include <stdexcept>
+#include <string>
 
-using fast_livo::adaptive_window::AdaptiveWindowBackend;
-using fast_livo::adaptive_window::AdaptiveWindowConfig;
-using fast_livo::adaptive_window::CrossModalObservation;
-using fast_livo::adaptive_window::CrossModalObservationVector;
-using fast_livo::adaptive_window::ExtrinsicState;
-using fast_livo::adaptive_window::ImuSample;
-using fast_livo::adaptive_window::ImuSampleVector;
-using fast_livo::adaptive_window::LidarExtrinsic;
-using fast_livo::adaptive_window::LidarPlaneObservation;
-using fast_livo::adaptive_window::LidarPlaneObservationVector;
-using fast_livo::adaptive_window::MeasurementSummary;
-using fast_livo::adaptive_window::Modality;
-using fast_livo::adaptive_window::NavState;
-
-namespace
-{
-
-void CheckCrossModalJacobian()
-{
-  using fast_livo::adaptive_window::ApplyIncrement;
-  using fast_livo::adaptive_window::FactorBuilders;
-  using fast_livo::adaptive_window::LinearFactor;
-  using fast_livo::adaptive_window::ProjectionFunction;
-  using fast_livo::adaptive_window::kExtrinsicDim;
-  using fast_livo::adaptive_window::kNavStateDim;
-
-  ProjectionFunction projection =
-      [](const Eigen::Vector3d &point, Eigen::Vector2d *pixel,
-         Eigen::Matrix<double, 2, 3> *jacobian) {
-        if (point.z() <= 0.1) return false;
-        pixel->x() = 250.0 * point.x() / point.z() + 320.0;
-        pixel->y() = 245.0 * point.y() / point.z() + 240.0;
-        jacobian->setZero();
-        (*jacobian)(0, 0) = 250.0 / point.z();
-        (*jacobian)(0, 2) =
-            -250.0 * point.x() / (point.z() * point.z());
-        (*jacobian)(1, 1) = 245.0 / point.z();
-        (*jacobian)(1, 2) =
-            -245.0 * point.y() / (point.z() * point.z());
-        return true;
-      };
-
-  NavState lidar_state;
-  lidar_state.q_w_i =
-      Eigen::Quaterniond(Eigen::AngleAxisd(0.1, Eigen::Vector3d::UnitY()));
-  lidar_state.p_w_i = Eigen::Vector3d(0.2, -0.1, 0.05);
-  NavState image_state;
-  image_state.q_w_i =
-      Eigen::Quaterniond(Eigen::AngleAxisd(-0.08, Eigen::Vector3d::UnitX()));
-  image_state.p_w_i = Eigen::Vector3d(0.25, -0.08, 0.07);
-  LidarExtrinsic lidar_extrinsic;
-  lidar_extrinsic.p_i_l = Eigen::Vector3d(0.03, 0.01, -0.02);
-  ExtrinsicState camera_extrinsic;
-  camera_extrinsic.q_c_i =
-      Eigen::Quaterniond(Eigen::AngleAxisd(0.05, Eigen::Vector3d::UnitZ()));
-  camera_extrinsic.p_c_i = Eigen::Vector3d(0.02, -0.01, 0.01);
-  CrossModalObservation observation;
-  observation.point_l = Eigen::Vector3d(0.3, -0.2, 4.0);
-  observation.pixel = Eigen::Vector2d(330.0, 225.0);
-
-  const LinearFactor base = FactorBuilders::CrossModalReprojection(
-      1, 2, lidar_state, image_state, lidar_extrinsic, camera_extrinsic,
-      observation, projection, 1.0, 1.0, 3.0);
-  assert(base.IsValid());
-  constexpr double epsilon = 1.0e-7;
-
-  for (int block = 0; block < 3; ++block)
-  {
-    const int columns = block == 2 ? kExtrinsicDim : 6;
-    for (int column = 0; column < columns; ++column)
-    {
-      NavState perturbed_lidar = lidar_state;
-      NavState perturbed_image = image_state;
-      ExtrinsicState perturbed_extrinsic = camera_extrinsic;
-      if (block < 2)
-      {
-        Eigen::Matrix<double, kNavStateDim, 1> increment =
-            Eigen::Matrix<double, kNavStateDim, 1>::Zero();
-        increment(column) = epsilon;
-        if (block == 0) perturbed_lidar = ApplyIncrement(lidar_state, increment);
-        else perturbed_image = ApplyIncrement(image_state, increment);
-      }
-      else
-      {
-        Eigen::Matrix<double, kExtrinsicDim, 1> increment =
-            Eigen::Matrix<double, kExtrinsicDim, 1>::Zero();
-        increment(column) = epsilon;
-        perturbed_extrinsic = ApplyIncrement(camera_extrinsic, increment);
-      }
-      const LinearFactor perturbed = FactorBuilders::CrossModalReprojection(
-          1, 2, perturbed_lidar, perturbed_image, lidar_extrinsic,
-          perturbed_extrinsic, observation, projection, 1.0, 1.0, 3.0);
-      const Eigen::Vector2d numerical =
-          (perturbed.residual - base.residual) / epsilon;
-      assert((numerical - base.jacobians[block].col(column)).norm() < 1.0e-3);
+using namespace fast_livo::adaptive_window;
+namespace {
+void Require(bool condition, const std::string &message) {
+  if (!condition) throw std::runtime_error(message); // active in Release builds
+}
+ProjectionFunction Projection() {
+  return [](const Eigen::Vector3d &p, Eigen::Vector2d *uv, Eigen::Matrix<double, 2, 3> *j) {
+    if (!p.allFinite() || p.z() <= 0.1) return false;
+    *uv = Eigen::Vector2d(200.0 * p.x() / p.z() + 320.0, 200.0 * p.y() / p.z() + 240.0);
+    *j << 200.0 / p.z(), 0.0, -200.0 * p.x() / (p.z() * p.z()),
+          0.0, 200.0 / p.z(), -200.0 * p.y() / (p.z() * p.z());
+    return true;
+  };
+}
+ImageSampleFunction Image(double camera_x = 0.0) {
+  return [camera_x](const Eigen::Vector2d &uv, double *value, Eigen::Vector2d *gradient) {
+    const double u = uv.x() + 50.0 * camera_x, v = uv.y();
+    *value = 100.0 + 0.2 * u + 0.15 * v + 0.0001 * u * v;
+    *gradient = Eigen::Vector2d(0.2 + 0.0001 * v, 0.15 + 0.0001 * u);
+    return uv.allFinite();
+  };
+}
+ImuSampleVector Samples(double start, double end, double step = 0.005) {
+  ImuSampleVector samples;
+  const int n = static_cast<int>(std::ceil((end - start) / step));
+  for (int i = 0; i <= n; ++i) {
+    ImuSample s;
+    s.timestamp = start + (end - start) * i / n;
+    s.acceleration = Eigen::Vector3d(0, 0, 9.81);
+    samples.push_back(s);
+  }
+  return samples;
+}
+std::vector<double> Motion(const NavState &s) {
+  return {s.v_w_i.x(), s.v_w_i.y(), s.v_w_i.z(),
+          s.bias_a.x(), s.bias_a.y(), s.bias_a.z(), s.bias_g.x(), s.bias_g.y(), s.bias_g.z()};
+}
+Eigen::VectorXd Residual(const NonlinearFactor &f, const std::vector<std::vector<double>> &blocks) {
+  Require(bool(f.cost), "null cost");
+  std::vector<const double *> pointers;
+  for (const auto &b : blocks) pointers.push_back(b.data());
+  Eigen::VectorXd r(f.cost->num_residuals());
+  Require(f.cost->Evaluate(pointers.data(), r.data(), nullptr), "cost evaluation failed");
+  Require(r.allFinite(), "nonfinite residual");
+  return r;
+}
+// Compare ambient autodiff * manifold PlusJacobian against central differences
+// in the actual tangent space; this catches quaternion ordering/half-angle bugs.
+void CheckJacobian(const NonlinearFactor &f, const std::vector<std::vector<double>> &blocks,
+                   double tolerance = 2e-5) {
+  const int rows = f.cost->num_residuals();
+  std::vector<const double *> pointers;
+  std::vector<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> j;
+  j.reserve(blocks.size());
+  std::vector<double *> jp;
+  for (std::size_t k = 0; k < blocks.size(); ++k) {
+    pointers.push_back(blocks[k].data());
+    j.emplace_back(rows, blocks[k].size()); jp.push_back(j.back().data());
+  }
+  Eigen::VectorXd r(rows);
+  Require(f.cost->Evaluate(pointers.data(), r.data(), jp.data()), "jacobian evaluation");
+  PoseManifold manifold;
+  for (std::size_t k = 0; k < blocks.size(); ++k) {
+    Eigen::MatrixXd analytic = j[k];
+    if (f.keys[k].is_pose()) {
+      Eigen::Matrix<double, 7, 6, Eigen::RowMajor> plus;
+      manifold.PlusJacobian(blocks[k].data(), plus.data());
+      analytic = (j[k] * plus).eval();
+    }
+    for (int col = 0; col < f.keys[k].local_size(); ++col) {
+      auto high = blocks, low = blocks;
+      const double epsilon = 1e-6;
+      if (f.keys[k].is_pose()) {
+        Eigen::Matrix<double, 6, 1> d = Eigen::Matrix<double, 6, 1>::Zero();
+        d[col] = epsilon; manifold.Plus(blocks[k].data(), d.data(), high[k].data());
+        d[col] = -epsilon; manifold.Plus(blocks[k].data(), d.data(), low[k].data());
+      } else { high[k][col] += epsilon; low[k][col] -= epsilon; }
+      const Eigen::VectorXd numeric = (Residual(f, high) - Residual(f, low)) / (2.0 * epsilon);
+      Require((numeric - analytic.col(col)).norm() / (1.0 + numeric.norm()) < tolerance,
+              "tangent Jacobian mismatch: block " + std::to_string(k) + ", column " + std::to_string(col));
     }
   }
 }
-
-}  // namespace
-
-int main()
-{
-  CheckCrossModalJacobian();
-  AdaptiveWindowConfig config;
-  config.enabled = true;
-  config.min_window_size = 3;
-  config.max_window_size = 5;
-  config.initial_window_size = 3;
-  config.min_keyframe_dt = 0.01;
-  config.max_keyframe_dt = 0.09;
-  config.keyframe_utility_threshold = 0.0;
-  config.association_max_dt = 0.11;
-  config.max_lidar_factors = 8;
-  config.max_cross_modal_factors = 8;
-
-  AdaptiveWindowBackend backend(config);
-  LidarExtrinsic lidar_extrinsic;
-  ExtrinsicState camera_extrinsic;
-  backend.Initialize(
-      lidar_extrinsic, camera_extrinsic,
-      [](const Eigen::Vector3d &point, Eigen::Vector2d *pixel,
-         Eigen::Matrix<double, 2, 3> *jacobian) {
-        if (point.z() <= 0.1) return false;
-        constexpr double fx = 200.0;
-        constexpr double fy = 200.0;
-        pixel->x() = fx * point.x() / point.z() + 320.0;
-        pixel->y() = fy * point.y() / point.z() + 240.0;
-        jacobian->setZero();
-        (*jacobian)(0, 0) = fx / point.z();
-        (*jacobian)(0, 2) = -fx * point.x() / (point.z() * point.z());
-        (*jacobian)(1, 1) = fy / point.z();
-        (*jacobian)(1, 2) = -fy * point.y() / (point.z() * point.z());
-        return true;
-      });
-
-  MeasurementSummary lidar_summary;
-  lidar_summary.modality = Modality::kLidar;
-  lidar_summary.information.setIdentity();
-  lidar_summary.information *= 100.0;
-  lidar_summary.residual_count = 20;
-  lidar_summary.rmse = 0.01;
-  lidar_summary.inlier_ratio = 0.9;
-
-  MeasurementSummary vision_summary = lidar_summary;
-  vision_summary.modality = Modality::kVision;
-  vision_summary.rmse = 5.0;
-
-  NavState latest;
-  for (int frame = 0; frame < 9; ++frame)
-  {
-    const double timestamp = 0.1 * frame;
-    NavState state;
-    state.timestamp = timestamp;
-    state.p_w_i.x() = 0.05 * frame;
-
-    ImuSampleVector imu;
-    for (int sample = 0; sample <= 10; ++sample)
-    {
-      ImuSample value;
-      value.timestamp = timestamp - 0.1 + 0.01 * sample;
-      value.acceleration = Eigen::Vector3d(0.0, 0.0, 9.81);
-      imu.push_back(value);
-    }
-    backend.AddImuSamples(imu);
-
-    LidarPlaneObservationVector planes;
-    for (int i = 0; i < 10; ++i)
-    {
-      LidarPlaneObservation plane;
-      plane.point_l = Eigen::Vector3d(0.1 * i, 0.0, 1.0);
-      plane.normal_w = Eigen::Vector3d::UnitZ();
-      plane.center_w = Eigen::Vector3d(0.0, 0.0, 1.0);
-      plane.variance = 0.01;
-      planes.push_back(plane);
-    }
-    lidar_summary.timestamp = timestamp;
-    backend.ProcessLidar(state, lidar_summary, planes);
-
-    CrossModalObservation observation;
-    observation.lidar_timestamp = timestamp;
-    observation.image_timestamp = timestamp + 0.02;
-    observation.point_l = Eigen::Vector3d(0.0, 0.0, 5.0);
-    observation.pixel = Eigen::Vector2d(318.0, 240.0);
-    observation.pixel_sigma = 2.0;
-    observation.patch_offsets = {
-        Eigen::Vector2d(-1.0, -1.0), Eigen::Vector2d(1.0, -1.0),
-        Eigen::Vector2d(-1.0, 1.0), Eigen::Vector2d(1.0, 1.0)};
-    for (const auto &offset : observation.patch_offsets)
-      observation.reference_intensities.push_back(
-          100.0 + 0.1 * (320.0 + offset.x()) +
-          0.2 * (240.0 + offset.y()));
-    observation.photometric_sigma = 5.0;
-    CrossModalObservationVector cross_observations{observation};
-
-    NavState image_state = state;
-    image_state.timestamp = observation.image_timestamp;
-    vision_summary.timestamp = image_state.timestamp;
-    backend.ProcessVision(
-        image_state, vision_summary, cross_observations,
-        [](const Eigen::Vector2d &pixel, double *intensity,
-           Eigen::Vector2d *gradient) {
-          *intensity = 100.0 + 0.1 * pixel.x() + 0.2 * pixel.y();
-          *gradient = Eigen::Vector2d(0.1, 0.2);
-          return true;
-        });
+VisualPatchObservation Patch(std::uint64_t track, double x) {
+  VisualPatchObservation o;
+  o.track_id = track; o.point_w = Eigen::Vector3d(0.1 * track, 0, 4);
+  o.center_ray = Eigen::Vector3d((o.point_w.x() - x) / 4, 0, 1);
+  o.normal_c = Eigen::Vector3d::UnitZ(); o.inverse_depth = 0.25;
+  for (int row : {-1, 1}) for (int col : {-1, 1}) {
+    Eigen::Vector3d ray = o.center_ray + Eigen::Vector3d(col / 200.0, row / 200.0, 0);
+    Eigen::Vector2d pixel, gradient; Eigen::Matrix<double, 2, 3> j; double intensity;
+    Projection()(ray, &pixel, &j); Image(x)(pixel, &intensity, &gradient);
+    o.rays.push_back(ray); o.intensities.push_back(intensity);
   }
+  return o;
+}
+void TestManifold() {
+  PoseManifold manifold;
+  auto x = PackPose(Eigen::Vector3d(1, 2, 3), ExpQuaternion(Eigen::Vector3d(0.2, -0.1, 0.3)));
+  std::array<double, 7> y;
+  Eigen::Matrix<double, 6, 1> d, recovered;
+  d << 0.1, -0.2, 0.3, 0.03, -0.02, 0.04;
+  Require(manifold.Plus(x.data(), d.data(), y.data()), "pose plus");
+  manifold.Minus(y.data(), x.data(), recovered.data());
+  Require((d - recovered).norm() < 1e-10, "pose plus/minus inverse");
+  Eigen::Matrix<double, 7, 6, Eigen::RowMajor> jp;
+  Eigen::Matrix<double, 6, 7, Eigen::RowMajor> jm;
+  manifold.PlusJacobian(x.data(), jp.data()); manifold.MinusJacobian(x.data(), jm.data());
+  Require((jm * jp - Eigen::Matrix<double, 6, 6>::Identity()).norm() < 1e-10, "manifold Jacobian inverse");
+  for (int col = 0; col < 6; ++col) {
+    Eigen::Matrix<double, 6, 1> step = Eigen::Matrix<double, 6, 1>::Zero();
+    std::array<double, 7> hi, lo;
+    step[col] = 1e-7; manifold.Plus(x.data(), step.data(), hi.data());
+    step[col] = -1e-7; manifold.Plus(x.data(), step.data(), lo.data());
+    Eigen::Map<Eigen::Matrix<double, 7, 1>> h(hi.data()), l(lo.data());
+    Require(((h - l) / 2e-7 - jp.col(col)).norm() < 1e-7, "manifold numerical Jacobian");
+  }
+}
+void TestPreintegrationAndFactors() {
+  AdaptiveWindowConfig config;
+  auto pre = std::make_shared<ImuPreintegration>(config);
+  const auto raw = Samples(-0.01, 1.01);
+  Require(pre->Integrate(raw, 0, 1, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()), "integration");
+  Require(std::abs(pre->dt - 1) < 1e-10, "integration duration");
+  Require((pre->dp - Eigen::Vector3d(0, 0, 4.905)).norm() < 1e-8, "midpoint position");
+  Require((pre->dv - Eigen::Vector3d(0, 0, 9.81)).norm() < 1e-8, "midpoint velocity");
+  Require((pre->covariance - pre->covariance.transpose()).norm() < 1e-10, "symmetric covariance");
+  Require(pre->covariance.diagonal().minCoeff() > 0, "bias random-walk covariance");
+  NavState a, b; b.timestamp = 1;
+  auto imu = FactorBuilders::Imu(1, 2, a.gravity_w, pre);
+  std::vector<std::vector<double>> ib{PackPose(a.p_w_i, a.q_w_i), Motion(a), PackPose(b.p_w_i, b.q_w_i), Motion(b)};
+  Require(Residual(imu, ib).norm() < 1e-6, "stationary gravity sign");
+  ib[2] = PackPose(Eigen::Vector3d(0.03, 0.02, -0.01), ExpQuaternion(Eigen::Vector3d(0.01, 0.02, -0.03)));
+  CheckJacobian(imu, ib);
+  ImuPreintegration invalid(config);
+  Require(!invalid.Integrate(raw, -0.02, 1, a.bias_a, a.bias_g), "missing start bracket");
+  Require(!invalid.Integrate(raw, 0, 1.02, a.bias_a, a.bias_g), "missing end bracket");
+  Require(!invalid.Integrate(Samples(0, 1, 0.2), 0, 1, a.bias_a, a.bias_g), "IMU gap rejection");
+  auto duplicate = raw; duplicate.insert(duplicate.begin() + 1, duplicate.front());
+  Require(!invalid.Integrate(duplicate, 0, 1, a.bias_a, a.bias_g), "duplicate time rejection");
+  const auto base_dp = pre->dp;
+  Eigen::Vector3d delta_ba(0.01, -0.02, 0.03);
+  const Eigen::Vector3d predicted = base_dp + pre->jacobian.block<3, 3>(0, 9) * delta_ba;
+  Require(pre->Repropagate(delta_ba, Eigen::Vector3d::Zero()), "bias repropagation");
+  Require((pre->dp - predicted).norm() < 1e-8, "bias correction vs repropagation");
 
-  const auto diagnostics = backend.diagnostics();
-  assert(diagnostics.solve_success);
-  assert(diagnostics.window_size <=
-         static_cast<std::size_t>(diagnostics.target_window_size));
-  assert(diagnostics.window_size >= 1);
-  assert(diagnostics.cross_modal_pairs > 0);
-  assert(backend.LatestEstimate(&latest));
-  assert(std::isfinite(latest.p_w_i.x()));
-
-  std::cout << "adaptive_window_smoke: window=" << diagnostics.window_size
-            << ", factors=" << diagnostics.factor_count
-            << ", cross_pairs=" << diagnostics.cross_modal_pairs << '\n';
-  return 0;
+  const auto pose = PackPose(Eigen::Vector3d(0.1, 0.2, 0.3), ExpQuaternion(Eigen::Vector3d(0.1, -0.05, 0.03)));
+  const auto other = PackPose(Eigen::Vector3d(0.15, 0.1, 0.25), ExpQuaternion(Eigen::Vector3d(-0.04, 0.02, 0.06)));
+  ExtrinsicState ext; ext.p_c_i = Eigen::Vector3d(0.02, -0.01, 0.03);
+  ext.q_c_i = ExpQuaternion(Eigen::Vector3d(0.02, 0.03, -0.01));
+  auto extrinsic = PackPose(ext.p_c_i, ext.q_c_i);
+  LidarExtrinsic lidar; lidar.p_i_l = Eigen::Vector3d(-0.01, 0.03, 0.02);
+  LidarPlaneObservation observation;
+  observation.point_l = Eigen::Vector3d(0.1, 0.2, 4);
+  observation.normal_w = Eigen::Vector3d(0.1, 0.2, 1).normalized();
+  observation.center_w = Eigen::Vector3d(0, 0, 4);
+  CheckJacobian(FactorBuilders::Lidar(1, lidar, observation, 2), {pose});
+  auto patch = Patch(1, 0);
+  patch.normal_c = Eigen::Vector3d(0.1, -0.2, 1).normalized();
+  CheckJacobian(FactorBuilders::Photometric(1, 2, 1, patch, 1.1, Projection(), Image(), 3, 1),
+                {pose, other, extrinsic, {0.25}});
+  LocalPlane plane; plane.center_l = Eigen::Vector3d(0, 0, 4);
+  CheckJacobian(FactorBuilders::PatchPlane(1, 2, 1, patch.center_ray, lidar, plane, 3, 1),
+                {pose, other, extrinsic, {0.25}});
+  CheckJacobian(FactorBuilders::PatchPlane(1, 1, 1, patch.center_ray, lidar, plane, 3, 1),
+                {extrinsic, {0.25}});
+  CheckJacobian(FactorBuilders::InitialState(1, a, config), {pose, Motion(a)});
+  CheckJacobian(FactorBuilders::ExtrinsicPrior(ext, config), {extrinsic});
+}
+void TestMarginalization() {
+  AdaptiveWindowConfig c; c.solver_time_limit = 1;
+  FixedLagOptimizer optimizer(c); optimizer.Reset(ExtrinsicState());
+  optimizer.AddFactor(FactorBuilders::ExtrinsicPrior(ExtrinsicState(), c));
+  NavState state;
+  const auto first = optimizer.AddNode(state);
+  Require(optimizer.AddFactor(FactorBuilders::InitialState(first, state, c)), "initial prior");
+  auto previous = first;
+  for (int i = 1; i < 4; ++i) {
+    state.timestamp = 0.1 * i;
+    const auto current = optimizer.AddNode(state);
+    auto pre = std::make_shared<ImuPreintegration>(c);
+    Require(pre->Integrate(Samples(0.1 * (i - 1) - 0.01, state.timestamp + 0.01),
+        0.1 * (i - 1), state.timestamp, state.bias_a, state.bias_g), "marginal IMU");
+    Require(optimizer.AddFactor(FactorBuilders::Imu(previous, current, state.gravity_w, pre)), "IMU factor");
+    previous = current;
+  }
+  Require(optimizer.AddDepth(99, 2, 0.25), "landmark depth");
+  LocalPlane plane; plane.center_l.z() = 4;
+  Require(optimizer.AddFactor(FactorBuilders::PatchPlane(2, 2, 99, Eigen::Vector3d::UnitZ(),
+      LidarExtrinsic(), plane, 3, 1)), "landmark plane");
+  double before = 0, after = 0;
+  Require(optimizer.Solve(&before), "solve before marginalization");
+  Require(optimizer.Marginalize(2), "middle-frame Schur marginalization");
+  Require(!optimizer.HasDepth(99), "anchor/depth removed together");
+  Require(optimizer.Solve(&after), "solve after middle marginalization");
+  Require(after < 1e-6 && optimizer.NumNodes() == 3, "Schur zero residual preservation");
+  Require(optimizer.CountFactors(Modality::kImu) == 1, "only touching IMU factors absorbed");
+  Require(optimizer.Marginalize(first), "oldest-frame marginalization with existing prior");
+  Require(optimizer.Solve(&after), "solve after oldest marginalization");
+  Require(!optimizer.Marginalize(previous), "newest state protected");
+  Require(optimizer.NumNodes() == 2, "bounded node count");
+}
+void TestBackend(bool asynchronous) {
+  AdaptiveWindowConfig c;
+  c.enabled = true; c.min_window_size = 3; c.max_window_size = 5; c.initial_window_size = 3;
+  c.min_keyframe_dt = 0.001; c.max_keyframe_dt = 0.09; c.keyframe_utility_threshold = 0;
+  c.solver_time_limit = 1; c.max_lidar_factors = 20; c.max_cross_modal_factors = 8;
+  AdaptiveWindowBackend backend(c); backend.Initialize(LidarExtrinsic(), ExtrinsicState(), Projection());
+  MeasurementSummary summary;
+  summary.information.setIdentity(); summary.information *= 100;
+  summary.residual_count = 100; summary.rmse = 0.01; summary.inlier_ratio = 1;
+  bool saw_photo = false, saw_plane = false, saw_marginalization = false;
+  for (int frame = 0; frame < 12; ++frame) {
+    const double time = 0.1 * frame;
+    backend.AddImuSamples(Samples(time - 0.11, time + 0.04));
+    NavState s; s.timestamp = time; s.p_w_i.x() = 0.2 * time; s.v_w_i.x() = 0.2;
+    LidarPlaneObservationVector lidar;
+    for (int row = -4; row <= 4; ++row) for (int col = -4; col <= 7; ++col) {
+      LidarPlaneObservation o;
+      o.point_l = Eigen::Vector3d(0.1 * col - s.p_w_i.x(), 0.1 * row, 4);
+      o.center_w.z() = 4; o.variance = 0.01; lidar.push_back(o);
+    }
+    Require(backend.ProcessLidar(s, summary, lidar), "backend lidar");
+    if (asynchronous) { s.timestamp += 0.02; s.p_w_i.x() += 0.004; }
+    VisualPatchObservationVector patches;
+    for (std::uint64_t id = 1; id <= 4; ++id) patches.push_back(Patch(id, s.p_w_i.x()));
+    Require(backend.ProcessVision(s, summary, patches, Image(s.p_w_i.x())), "backend vision");
+    const auto &d = backend.diagnostics();
+    Require(d.reset_count == 0 && d.rejected_imu_intervals == 0, "unexpected recovery or IMU rejection");
+    Require(d.window_size <= static_cast<std::size_t>(c.max_window_size), "window bound");
+    Require(d.lidar_factors > 0, "missing lidar factors");
+    saw_photo = saw_photo || d.vision_factors > 0;
+    saw_plane = saw_plane || d.cross_modal_pairs > 0;
+    saw_marginalization = saw_marginalization || d.last_marginalized_id != 0;
+    NavState estimate; Require(backend.LatestEstimate(&estimate), "latest state");
+    Require((estimate.p_w_i - s.p_w_i).norm() < 1e-4, "synthetic exact trajectory");
+    const auto factor_count = d.factor_count;
+    Require(!backend.ProcessVision(s, summary, patches, Image()), "duplicate image rejection");
+    Require(backend.diagnostics().factor_count == factor_count, "duplicate changed graph");
+  }
+  Require(saw_photo && saw_plane && saw_marginalization, "not all factor/marginalization paths covered");
+  backend.Reset();
+  NavState s; backend.ProcessLidar(s, summary, {});
+  s.timestamp = 0.1;
+  Require(!backend.ProcessLidar(s, summary, {}), "unbracketed IMU must not create a node");
+  Require(backend.diagnostics().rejected_imu_intervals == 1, "IMU rejection diagnostic");
+}
+}
+int main() {
+  try {
+    TestManifold(); TestPreintegrationAndFactors(); TestMarginalization();
+    TestBackend(false); TestBackend(true);
+    std::cout << "All Ceres adaptive-window checks passed.\n";
+    return 0;
+  } catch (const std::exception &error) {
+    std::cerr << "FAILED: " << error.what() << "\n";
+    return 1;
+  }
 }

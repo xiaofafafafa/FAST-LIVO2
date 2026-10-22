@@ -1,12 +1,26 @@
-cmake_minimum_required(VERSION 2.8.3)
+cmake_minimum_required(VERSION 3.16)
 project(fast_livo)
 
-set(CMAKE_BUILD_TYPE "Release")
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE "Release")
+endif()
 message(STATUS "Build Type: ${CMAKE_BUILD_TYPE}")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+find_package(Eigen3 3.3 REQUIRED NO_MODULE)
+find_package(Ceres 2.1 REQUIRED)
+option(ADAPTIVE_WINDOW_STANDALONE "Build Ceres backend and tests without ROS/PCL/OpenCV" OFF)
+if(ADAPTIVE_WINDOW_STANDALONE)
+  include(cmake/AdaptiveWindow.cmake)
+  include(CTest)
+  if(BUILD_TESTING)
+    add_adaptive_window_tests()
+  endif()
+  return()
+endif()
 
 # Set common compile options
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -fexceptions")
@@ -93,7 +107,6 @@ find_package(catkin REQUIRED COMPONENTS
   image_transport
 )
 
-find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(Sophus REQUIRED)
@@ -120,15 +133,7 @@ include_directories(
 )
 
 # Add libraries
-add_library(adaptive_window_core
-  src/adaptive_window/linear_factor.cpp
-  src/adaptive_window/information_evaluator.cpp
-  src/adaptive_window/adaptive_policy.cpp
-  src/adaptive_window/temporal_associator.cpp
-  src/adaptive_window/fixed_lag_optimizer.cpp
-  src/adaptive_window/factor_builders.cpp
-  src/adaptive_window/adaptive_window_backend.cpp
-)
+include(cmake/AdaptiveWindow.cmake)
 add_library(vio src/vio.cpp src/frame.cpp src/visual_point.cpp)
 add_library(lio src/voxel_map.cpp)
 add_library(pre src/preprocess.cpp)
@@ -138,6 +143,9 @@ add_library(laser_mapping
   src/adaptive_window/fast_livo_bridge.cpp
 )
 target_link_libraries(laser_mapping adaptive_window_core ${catkin_LIBRARIES})
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(laser_mapping PRIVATE -fno-fast-math)
+endif()
 
 # Add the main executable
 add_executable(fastlivo_mapping src/main.cpp)
@@ -163,7 +171,5 @@ if(mimalloc_FOUND)
 endif()
 
 if(CATKIN_ENABLE_TESTING)
-  add_executable(adaptive_window_smoke test/adaptive_window_smoke.cpp)
-  target_link_libraries(adaptive_window_smoke adaptive_window_core)
-  add_test(NAME adaptive_window_smoke COMMAND adaptive_window_smoke)
+  add_adaptive_window_tests()
 endif()

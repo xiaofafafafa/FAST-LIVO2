@@ -61,7 +61,7 @@ int AdaptivePolicy::UpdateWindowTarget(const double combined_quality,
 
   // A soft real-time safeguard. It only contracts the target by one frame per
   // decision, which avoids oscillation when the backend is close to its budget.
-  const double nominal_budget_ms = 30.0;
+  const double nominal_budget_ms = 1000.0 * config_.solver_time_limit;
   if (last_solve_time_ms > nominal_budget_ms &&
       desired > config_.min_window_size)
     --desired;

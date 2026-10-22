@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <stdexcept>
 #include <utility>
 
 namespace fast_livo
@@ -25,7 +26,7 @@ void ReadParameter(ros::NodeHandle &node_handle, const std::string &name,
 bool BilinearIntensity(const cv::Mat &image, const Eigen::Vector2d &pixel,
                        double *intensity)
 {
-  if (intensity == nullptr || image.empty() || image.type() != CV_8UC1)
+  if (intensity == nullptr || !pixel.allFinite() || image.empty() || image.type() != CV_8UC1)
     return false;
   const int x = static_cast<int>(std::floor(pixel.x()));
   const int y = static_cast<int>(std::floor(pixel.y()));
@@ -89,7 +90,7 @@ AdaptiveWindowConfig FastLivoBridge::LoadConfig(
                 &config.degeneracy_eigen_threshold);
   ReadParameter(node_handle, "lidar_rmse_scale", &config.lidar_rmse_scale);
   ReadParameter(node_handle, "vision_rmse_scale", &config.vision_rmse_scale);
-  ReadParameter(node_handle, "solver_damping", &config.solver_damping);
+  ReadParameter(node_handle, "solver_time_limit", &config.solver_time_limit);
   ReadParameter(node_handle, "solver_iterations", &config.solver_iterations);
   ReadParameter(node_handle, "huber_delta_lidar",
                 &config.huber_delta_lidar);
@@ -107,10 +108,21 @@ AdaptiveWindowConfig FastLivoBridge::LoadConfig(
   ReadParameter(node_handle, "imu_gyr_noise", &config.imu_gyr_noise);
   ReadParameter(node_handle, "imu_acc_bias_rw", &config.imu_acc_bias_rw);
   ReadParameter(node_handle, "imu_gyr_bias_rw", &config.imu_gyr_bias_rw);
-  ReadParameter(node_handle, "feedback_max_translation",
-                &config.feedback_max_translation);
-  ReadParameter(node_handle, "feedback_max_rotation_deg",
-                &config.feedback_max_rotation_deg);
+
+  ReadParameter(node_handle, "max_active_patches", &config.max_active_patches);
+  ReadParameter(node_handle, "huber_delta_vision", &config.huber_delta_vision);
+  ReadParameter(node_handle, "optimize_extrinsics", &config.optimize_extrinsics);
+  ReadParameter(node_handle, "plane_search_radius", &config.plane_search_radius);
+  ReadParameter(node_handle, "plane_max_rms", &config.plane_max_rms);
+  ReadParameter(node_handle, "cross_modal_plane_sigma", &config.cross_modal_plane_sigma);
+  ReadParameter(node_handle, "min_inverse_depth", &config.min_inverse_depth);
+  ReadParameter(node_handle, "max_inverse_depth", &config.max_inverse_depth);
+  ReadParameter(node_handle, "imu_max_gap", &config.imu_max_gap);
+  ReadParameter(node_handle, "imu_repropagate_acc_bias", &config.imu_repropagate_acc_bias);
+  ReadParameter(node_handle, "imu_repropagate_gyr_bias", &config.imu_repropagate_gyr_bias);
+  ReadParameter(node_handle, "velocity_prior_sigma", &config.velocity_prior_sigma);
+  ReadParameter(node_handle, "bias_prior_sigma", &config.bias_prior_sigma);
+  ReadParameter(node_handle, "information_eigen_floor", &config.information_eigen_floor);
 
   config.min_window_size = std::max(2, config.min_window_size);
   config.max_window_size =
@@ -151,7 +163,7 @@ FastLivoBridge::FastLivoBridge(ros::NodeHandle &node_handle,
       [camera = vio_manager->cam, border = vio_manager->border](
           const Eigen::Vector3d &point, Eigen::Vector2d *pixel,
           Eigen::Matrix<double, 2, 3> *jacobian) {
-        if (point.z() <= 1.0e-4 || pixel == nullptr || jacobian == nullptr)
+        if (!point.allFinite() || point.z() <= 1.0e-4 || pixel == nullptr || jacobian == nullptr)
           return false;
         *pixel = camera->world2cam(point);
         if (!pixel->allFinite() ||
@@ -162,13 +174,23 @@ FastLivoBridge::FastLivoBridge(ros::NodeHandle &node_handle,
         {
           Eigen::Vector3d perturbed = point;
           perturbed(column) += epsilon;
-          const Eigen::Vector2d projected = camera->world2cam(perturbed);
-          jacobian->col(column) = (projected - *pixel) / epsilon;
+          const Eigen::Vector2d plus = camera->world2cam(perturbed);
+          perturbed(column) -= 2.0 * epsilon;
+          jacobian->col(column) = (plus - camera->world2cam(perturbed)) / (2.0 * epsilon);
         }
         return jacobian->allFinite();
       };
 
-  backend_.reset(new AdaptiveWindowBackend(config_));
+  // State-only feedback cannot consistently update the frontend covariance/map.
+  // Keep this research backend in shadow mode until that transfer is designed.
+  if (config_.feedback_enabled)
+    ROS_WARN("Ceres backend: feedback_enabled is ignored; covariance-consistent feedback is not implemented.");
+  config_.feedback_enabled = false;
+  try { backend_.reset(new AdaptiveWindowBackend(config_)); }
+  catch (const std::invalid_argument &error) {
+    ROS_ERROR("Invalid adaptive-window configuration: %s", error.what());
+    config_.enabled = false; return;
+  }
   backend_->Initialize(lidar_extrinsic_, camera_extrinsic_initial_,
                        std::move(projection));
 
@@ -196,17 +218,6 @@ NavState FastLivoBridge::ToNavState(const double timestamp,
   result.bias_a = state.bias_a;
   result.gravity_w = state.gravity;
   return result;
-}
-
-void FastLivoBridge::CopyToFastLivoState(const NavState &input,
-                                         StatesGroup *output)
-{
-  if (output == nullptr) return;
-  output->rot_end = input.q_w_i.toRotationMatrix();
-  output->pos_end = input.p_w_i;
-  output->vel_end = input.v_w_i;
-  output->bias_g = input.bias_g;
-  output->bias_a = input.bias_a;
 }
 
 MeasurementSummary FastLivoBridge::BuildLidarSummary(
@@ -275,7 +286,7 @@ MeasurementSummary FastLivoBridge::BuildLidarSummary(
 
 MeasurementSummary FastLivoBridge::BuildVisionSummary(
     const double timestamp, const VIOManagerPtr &vio_manager,
-    CrossModalObservationVector *observations) const
+    VisualPatchObservationVector *observations) const
 {
   MeasurementSummary summary;
   summary.modality = Modality::kVision;
@@ -305,65 +316,53 @@ MeasurementSummary FastLivoBridge::BuildVisionSummary(
       std::min(1.0, static_cast<double>(vio_manager->total_points) /
                         std::max(1, vio_manager->length));
 
+  if (!vio_manager->new_frame_ || !vio_manager->cam) return summary;
+  const cv::Mat &image = vio_manager->new_frame_->img_;
   observations->reserve(vio_manager->visual_submap->voxel_points.size());
-  for (std::size_t i = 0;
-       i < vio_manager->visual_submap->voxel_points.size(); ++i)
+  for (std::size_t i = 0; i < vio_manager->visual_submap->voxel_points.size(); ++i)
   {
-    const VisualPoint *point =
-        vio_manager->visual_submap->voxel_points[i];
-    if (point == nullptr || !point->has_lidar_anchor_ ||
-        point->source_lidar_time_ < 0.0)
-      continue;
-    const Eigen::Vector2d pixel =
-        vio_manager->new_frame_->w2c(point->pos_);
+    const VisualPoint *point = vio_manager->visual_submap->voxel_points[i];
+    if (!point || !point->is_normal_initialized_ || !point->normal_.allFinite() ||
+        point->normal_.norm() < 1e-6) continue;
+    const Eigen::Vector3d point_c = vio_manager->new_frame_->w2f(point->pos_);
+    if (!point_c.allFinite() || point_c.z() <= 0.2) continue;
+    const Eigen::Vector2d pixel = vio_manager->cam->world2cam(point_c);
     if (!pixel.allFinite()) continue;
 
-    const double patch_squared_error =
-        i < vio_manager->visual_submap->errors.size()
-            ? std::max(0.0f, vio_manager->visual_submap->errors[i])
-            : 0.0;
-    const double patch_rmse = std::sqrt(
-        patch_squared_error / std::max(1, vio_manager->patch_size_total));
+    VisualPatchObservation observation;
+    observation.track_id = point->backend_track_id_;
+    observation.point_w = point->pos_;
+    observation.center_ray = point_c / point_c.z();
+    observation.inverse_depth = 1.0 / point_c.z();
+    observation.normal_c = (vio_manager->new_frame_->T_f_w_.rotation_matrix() *
+                            point->normal_).normalized();
+    const double error = i < vio_manager->visual_submap->errors.size()
+        ? std::max(0.0f, vio_manager->visual_submap->errors[i]) : 0.0;
+    observation.tracking_score = std::exp(-std::sqrt(error /
+        std::max(1, vio_manager->patch_size_total)) /
+        std::max(1e-6, config_.vision_rmse_scale));
+    observation.inverse_exposure = vio_manager->state
+        ? vio_manager->state->inv_expo_time : 1.0;
+    observation.photometric_sigma = std::sqrt(std::max(1e-6, vio_manager->img_point_cov));
 
-    CrossModalObservation observation;
-    observation.lidar_timestamp = point->source_lidar_time_;
-    observation.image_timestamp = timestamp;
-    observation.point_l = point->source_lidar_point_;
-    observation.pixel = pixel;
-    observation.pixel_sigma = Clamp(1.0 + 0.02 * patch_rmse, 1.0, 5.0);
-    observation.tracking_score =
-        std::exp(-patch_rmse /
-                 std::max(1.0e-6, config_.vision_rmse_scale));
-
-    if (i < vio_manager->visual_submap->warp_patch.size() &&
-        vio_manager->visual_submap->warp_patch[i].size() >=
-            static_cast<std::size_t>(vio_manager->patch_size_total))
-    {
-      const int patch_size = vio_manager->patch_size;
-      const int half = vio_manager->patch_size_half;
-      const int step = std::max(1, patch_size / 4);
-      const auto &reference_patch =
-          vio_manager->visual_submap->warp_patch[i];
-      for (int row = 0; row < patch_size; row += step)
+    // A bounded 4 x 4 patch on pyramid level zero, sampled from the ORIGINAL
+    // current image. The backend chooses references and rewarps at each solve.
+    const int half = vio_manager->patch_size_half;
+    bool valid = true;
+    for (int row = 0; row < 4 && valid; ++row)
+      for (int col = 0; col < 4; ++col)
       {
-        for (int column = 0; column < patch_size; column += step)
-        {
-          observation.patch_offsets.emplace_back(column - half, row - half);
-          observation.reference_intensities.push_back(
-              reference_patch[row * patch_size + column]);
-        }
+        const Eigen::Vector2d offset(-half + (2.0 * half - 1.0) * col / 3.0,
+                                     -half + (2.0 * half - 1.0) * row / 3.0);
+        const Eigen::Vector2d sample_pixel = pixel + offset;
+        double value = 0.0;
+        Eigen::Vector3d ray = vio_manager->cam->cam2world(sample_pixel);
+        if (!ray.allFinite() || ray.z() <= 1e-6 ||
+            !BilinearIntensity(image, sample_pixel, &value)) { valid = false; break; }
+        observation.rays.push_back(ray / ray.z());
+        observation.intensities.push_back(value);
       }
-      observation.reference_inverse_exposure =
-          i < vio_manager->visual_submap->inv_expo_list.size()
-              ? vio_manager->visual_submap->inv_expo_list[i]
-              : 1.0;
-      observation.current_inverse_exposure =
-          vio_manager->state == nullptr ? 1.0
-                                        : vio_manager->state->inv_expo_time;
-      observation.photometric_sigma =
-          std::sqrt(std::max(1.0e-6, vio_manager->img_point_cov));
-    }
-    observations->push_back(observation);
+    if (valid) observations->push_back(std::move(observation));
   }
   return summary;
 }
@@ -432,12 +431,12 @@ bool FastLivoBridge::ProcessVision(const double timestamp,
   }
   backend_->AddImuSamples(samples);
 
-  CrossModalObservationVector observations;
+  VisualPatchObservationVector observations;
   const MeasurementSummary summary =
       BuildVisionSummary(timestamp, vio_manager, &observations);
   const cv::Mat current_image =
       (vio_manager != nullptr && vio_manager->new_frame_ != nullptr)
-          ? vio_manager->new_frame_->img_
+          ? vio_manager->new_frame_->img_.clone()
           : cv::Mat();
   const ImageSampleFunction image_sampler =
       [current_image](const Eigen::Vector2d &pixel, double *intensity,
@@ -445,81 +444,21 @@ bool FastLivoBridge::ProcessVision(const double timestamp,
         if (gradient == nullptr ||
             !BilinearIntensity(current_image, pixel, intensity))
           return false;
-        double left = 0.0, right = 0.0, top = 0.0, bottom = 0.0;
-        if (!BilinearIntensity(current_image,
-                               pixel + Eigen::Vector2d(-1.0, 0.0), &left) ||
-            !BilinearIntensity(current_image,
-                               pixel + Eigen::Vector2d(1.0, 0.0), &right) ||
-            !BilinearIntensity(current_image,
-                               pixel + Eigen::Vector2d(0.0, -1.0), &top) ||
-            !BilinearIntensity(current_image,
-                               pixel + Eigen::Vector2d(0.0, 1.0), &bottom))
-          return false;
-        *gradient = Eigen::Vector2d(0.5 * (right - left),
-                                    0.5 * (bottom - top));
+        const int x = static_cast<int>(std::floor(pixel.x()));
+        const int y = static_cast<int>(std::floor(pixel.y()));
+        const double dx = pixel.x() - x, dy = pixel.y() - y;
+        const double a = current_image.at<std::uint8_t>(y, x);
+        const double b = current_image.at<std::uint8_t>(y, x + 1);
+        const double c = current_image.at<std::uint8_t>(y + 1, x);
+        const double d = current_image.at<std::uint8_t>(y + 1, x + 1);
+        *gradient = Eigen::Vector2d((1.0 - dy) * (b - a) + dy * (d - c),
+                                    (1.0 - dx) * (c - a) + dx * (d - b));
         return true;
       };
   const bool result = backend_->ProcessVision(
       ToNavState(timestamp, state), summary, observations, image_sampler);
   Publish(timestamp);
   return result;
-}
-
-bool FastLivoBridge::ApplyStateFeedback(const double timestamp,
-                                        StatesGroup *state) const
-{
-  if (!enabled() || !config_.feedback_enabled || state == nullptr)
-    return false;
-  NavState estimate;
-  if (!backend_->LatestEstimate(&estimate) ||
-      std::abs(estimate.timestamp - timestamp) >
-          config_.association_max_dt)
-    return false;
-
-  const double translation = (estimate.p_w_i - state->pos_end).norm();
-  const double rotation = Degrees(
-      LogQuaternion(Eigen::Quaterniond(state->rot_end).conjugate() *
-                    estimate.q_w_i)
-          .norm());
-  if (translation > config_.feedback_max_translation ||
-      rotation > config_.feedback_max_rotation_deg)
-  {
-    ROS_WARN_THROTTLE(1.0,
-                      "Adaptive feedback rejected: %.3f m, %.3f deg.",
-                      translation, rotation);
-    return false;
-  }
-  CopyToFastLivoState(estimate, state);
-  return true;
-}
-
-bool FastLivoBridge::ApplyExtrinsicFeedback(
-    const VIOManagerPtr &vio_manager) const
-{
-  if (!enabled() || !config_.feedback_enabled || vio_manager == nullptr)
-    return false;
-  const ExtrinsicState estimate = backend_->CameraExtrinsicEstimate();
-  const double translation =
-      (estimate.p_c_i - camera_extrinsic_initial_.p_c_i).norm();
-  const double rotation = Degrees(
-      LogQuaternion(camera_extrinsic_initial_.q_c_i.conjugate() *
-                    estimate.q_c_i)
-          .norm());
-  if (translation > config_.feedback_max_translation ||
-      rotation > config_.feedback_max_rotation_deg)
-    return false;
-
-  vio_manager->Rci = estimate.q_c_i.toRotationMatrix();
-  vio_manager->Pci = estimate.p_c_i;
-  vio_manager->Rcl = vio_manager->Rci *
-                     lidar_extrinsic_.q_i_l.toRotationMatrix();
-  vio_manager->Pcl =
-      vio_manager->Rci * lidar_extrinsic_.p_i_l + vio_manager->Pci;
-  vio_manager->Jdphi_dR = vio_manager->Rci;
-  const Eigen::Vector3d position_i_c =
-      -vio_manager->Rci.transpose() * vio_manager->Pci;
-  vio_manager->Jdp_dR = -vio_manager->Rci * Skew(position_i_c);
-  return true;
 }
 
 void FastLivoBridge::Publish(const double timestamp) const
@@ -529,7 +468,7 @@ void FastLivoBridge::Publish(const double timestamp) const
   if (backend_->LatestEstimate(&estimate))
   {
     nav_msgs::Odometry message;
-    message.header.stamp.fromSec(timestamp);
+    message.header.stamp.fromSec(estimate.timestamp);
     message.header.frame_id = "camera_init";
     message.child_frame_id = "body";
     message.pose.pose.position.x = estimate.p_w_i.x();
@@ -539,9 +478,10 @@ void FastLivoBridge::Publish(const double timestamp) const
     message.pose.pose.orientation.x = estimate.q_w_i.x();
     message.pose.pose.orientation.y = estimate.q_w_i.y();
     message.pose.pose.orientation.z = estimate.q_w_i.z();
-    message.twist.twist.linear.x = estimate.v_w_i.x();
-    message.twist.twist.linear.y = estimate.v_w_i.y();
-    message.twist.twist.linear.z = estimate.v_w_i.z();
+    const Eigen::Vector3d velocity_body = estimate.q_w_i.conjugate() * estimate.v_w_i;
+    message.twist.twist.linear.x = velocity_body.x();
+    message.twist.twist.linear.y = velocity_body.y();
+    message.twist.twist.linear.z = velocity_body.z();
     odometry_publisher_.publish(message);
   }
 
@@ -558,10 +498,19 @@ void FastLivoBridge::Publish(const double timestamp) const
       static_cast<double>(diagnostics.factor_count),
       static_cast<double>(diagnostics.cross_modal_pairs),
       diagnostics.camera_extrinsic_translation_change,
-      diagnostics.camera_extrinsic_rotation_change_deg};
+      diagnostics.camera_extrinsic_rotation_change_deg,
+      static_cast<double>(diagnostics.lidar_factors),
+      static_cast<double>(diagnostics.vision_factors),
+      static_cast<double>(diagnostics.imu_factors),
+      diagnostics.solve_success ? 1.0 : 0.0,
+      static_cast<double>(diagnostics.rejected_imu_intervals),
+      static_cast<double>(diagnostics.reset_count)};
   diagnostics_publisher_.publish(diagnostic_message);
 
-  const ExtrinsicState extrinsic = backend_->CameraExtrinsicEstimate();
+  ExtrinsicState extrinsic = backend_->CameraExtrinsicEstimate();
+  // TransformStamped(parent=IMU, child=camera) carries T_IC, not T_CI.
+  extrinsic.q_c_i = extrinsic.q_c_i.conjugate();
+  extrinsic.p_c_i = -(extrinsic.q_c_i * extrinsic.p_c_i);
   geometry_msgs::TransformStamped extrinsic_message;
   extrinsic_message.header.stamp.fromSec(timestamp);
   extrinsic_message.header.frame_id = "imu";
