@@ -1,4 +1,4 @@
-#include "adaptive_window/imu_preintegration.h"
+#include "adaptive_window/factor/integration_base.h"
 #include "adaptive_window/math_utils.h"
 #include <Eigen/Cholesky>
 #include <algorithm>
@@ -15,10 +15,10 @@ ImuSample Interpolate(const ImuSample &a, const ImuSample &b, double t) {
 }
 }
 
-bool ImuPreintegration::Integrate(const ImuSampleVector &samples, double start,
+bool IntegrationBase::integrate(const ImuSampleVector &samples, double start,
                                  double end, const Eigen::Vector3d &ba,
                                  const Eigen::Vector3d &bg) {
-  interval_.clear();
+  imu_buf.clear();
   if (!std::isfinite(start) || !std::isfinite(end) || end <= start || samples.size() < 2 ||
       samples.front().timestamp > start || samples.back().timestamp < end) return false;
   for (std::size_t i = 1; i < samples.size(); ++i) {
@@ -31,46 +31,46 @@ bool ImuPreintegration::Integrate(const ImuSampleVector &samples, double start,
     if (b.timestamp <= start || a.timestamp >= end) continue;
     if (b.timestamp - a.timestamp > config_.imu_max_gap) return false;
     const double t0 = std::max(start, a.timestamp), t1 = std::min(end, b.timestamp);
-    if (interval_.empty()) interval_.push_back(Interpolate(a, b, t0));
-    interval_.push_back(Interpolate(a, b, t1));
+    if (imu_buf.empty()) imu_buf.push_back(Interpolate(a, b, t0));
+    imu_buf.push_back(Interpolate(a, b, t1));
   }
-  if (interval_.size() < 2) return false;
-  return Repropagate(ba, bg);
+  if (imu_buf.size() < 2) return false;
+  return repropagate(ba, bg);
 }
 
-bool ImuPreintegration::NeedsRepropagation(const Eigen::Vector3d &ba,
+bool IntegrationBase::needsRepropagation(const Eigen::Vector3d &ba,
                                           const Eigen::Vector3d &bg) const {
   return (ba - linearized_ba).norm() > config_.imu_repropagate_acc_bias ||
          (bg - linearized_bg).norm() > config_.imu_repropagate_gyr_bias;
 }
 
-bool ImuPreintegration::Repropagate(const Eigen::Vector3d &ba, const Eigen::Vector3d &bg) {
-  if (interval_.size() < 2 || !ba.allFinite() || !bg.allFinite()) return false;
-  dt = 0.0; dp.setZero(); dv.setZero(); dq.setIdentity();
+bool IntegrationBase::repropagate(const Eigen::Vector3d &ba, const Eigen::Vector3d &bg) {
+  if (imu_buf.size() < 2 || !ba.allFinite() || !bg.allFinite()) return false;
+  sum_dt = 0.0; delta_p.setZero(); delta_v.setZero(); delta_q.setIdentity();
   covariance.setZero(); jacobian.setIdentity();
   linearized_ba = ba; linearized_bg = bg;
-  for (std::size_t i = 1; i < interval_.size(); ++i) Step(interval_[i - 1], interval_[i]);
+  for (std::size_t i = 1; i < imu_buf.size(); ++i) midPointIntegration(imu_buf[i - 1], imu_buf[i]);
   // Tiny numerical floor, not a motion prior. Avoid forming covariance.inverse().
   Matrix15 regularized = 0.5 * (covariance + covariance.transpose());
   regularized.diagonal().array() += 1e-12;
   Eigen::LLT<Matrix15> llt(regularized);
   if (llt.info() != Eigen::Success) return false;
   sqrt_information = llt.matrixL().solve(Matrix15::Identity());
-  return sqrt_information.allFinite() && dp.allFinite() && dv.allFinite();
+  return sqrt_information.allFinite() && delta_p.allFinite() && delta_v.allFinite();
 }
 
-void ImuPreintegration::Step(const ImuSample &a, const ImuSample &b) {
+void IntegrationBase::midPointIntegration(const ImuSample &a, const ImuSample &b) {
   const double h = b.timestamp - a.timestamp, h2 = h * h;
   const Eigen::Vector3d w = 0.5 * (a.angular_velocity + b.angular_velocity) - linearized_bg;
   const Eigen::Vector3d a0 = a.acceleration - linearized_ba, a1 = b.acceleration - linearized_ba;
-  const Eigen::Matrix3d r0 = dq.toRotationMatrix();
+  const Eigen::Matrix3d r0 = delta_q.toRotationMatrix();
   const Eigen::Quaterniond step(1.0, 0.5 * h * w.x(), 0.5 * h * w.y(), 0.5 * h * w.z());
-  const Eigen::Quaterniond next = (dq * step).normalized();
+  const Eigen::Quaterniond next = (delta_q * step).normalized();
   const Eigen::Matrix3d r1 = next.toRotationMatrix(), identity = Eigen::Matrix3d::Identity();
   const Eigen::Vector3d acceleration = 0.5 * (r0 * a0 + r1 * a1);
-  dp += dv * h + 0.5 * acceleration * h2;
-  dv += acceleration * h;
-  dq = next; dt += h;
+  delta_p += delta_v * h + 0.5 * acceleration * h2;
+  delta_v += acceleration * h;
+  delta_q = next; sum_dt += h;
 
   // First-order error dynamics of the midpoint rule; endpoint gyro noise also
   // perturbs the rotated endpoint acceleration. Discrete noise convention

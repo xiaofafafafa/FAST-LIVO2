@@ -28,7 +28,7 @@ private:
   static std::size_t Index(Modality modality);
 
   AdaptiveWindowConfig config_;
-  std::array<History, 5> history_;
+  std::array<History, 6> history_;
 };
 
 }  // namespace adaptive_window

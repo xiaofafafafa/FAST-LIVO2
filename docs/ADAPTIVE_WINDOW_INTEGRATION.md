@@ -4,6 +4,9 @@
 
 本分支从 `feature/adaptive-window-backend` 的
 `90acf12dd7e94081e00a63a86393768b63444cc0` 重构，替换旧的 Eigen 冻结线性因子求解器。
+随后在 Ceres 版本 `df8ee2a3dfc59a4158a3adc4b19b9a1c17ae6c9e` 上按 VINS-Mono 命名组织为
+`Estimator` + `factor/`，并加入 FAST-LIVO2 位姿正则项。代码阅读顺序见
+[VINS 风格代码导航](VINS_STYLE_BACKEND.md)。
 
 **当前是未完成编译和数据集验证的研究实现。** 开发环境没有 ROS、Eigen、Ceres 或
 CMake，依赖安装受限；下文的 C++ 测试已编写，但未在该环境执行。不能据此声称精度提高、
@@ -18,18 +21,23 @@ FAST-LIVO2 的 ESIKF 前端、去畸变和地图仍正常运行。本模块在�
 
 | 模块 | 职责 |
 |---|---|
-| `ceres_types.h` | 参数块标识、四元数布局、右扰动位姿流形、非线性因子容器 |
-| `imu_preintegration.*` | IMU 时间区间裁剪、中值积分、15 维协方差与偏置 Jacobian、重新积分 |
-| `factor_builders.*` | 四类观测残差、初始状态/外参先验、scan-local 平面拟合 |
-| `fixed_lag_optimizer.*` | Ceres 求解、残差重线性化、逆深度管理、Schur 边缘化 |
-| `information_evaluator.*` / `adaptive_policy.*` | 保留并接入原分支的信息评价、模态权重、关键帧、窗口和边缘化策略 |
-| `temporal_associator.*` | 在保留的 LiDAR 帧中做有限时间门限最近邻关联 |
-| `adaptive_window_backend.*` | 接收量测、建立状态/patch、调度求解、清理和故障恢复 |
-| `fast_livo_bridge.*` | ROS 参数、原始 patch 导出、相机/图像采样回调、诊断和里程计发布 |
+| `estimator.h/.cpp` | 状态管理、接收量测、构建因子、`optimization()`、`slideWindow()`、故障恢复 |
+| `ceres_types.h` | 参数块标识、VINS 风格尺寸和四元数布局 |
+| `factor/pose_local_parameterization.h` | Ceres Manifold API 下的位姿右扰动 |
+| `factor/integration_base.h/.cpp` | 时间区间裁剪、中值积分、15 维协方差、偏置 Jacobian 和重积分 |
+| `factor/{imu,lidar,photometric,patch_plane}_factor.h` | 保留的四类传感器残差 |
+| `factor/frontend_pose_factor.h` | FAST-LIVO2 每个状态的位姿正则项 |
+| `factor/factor_factory.h/.cpp` | 因子装配、参数块关联和 scan-local 平面拟合 |
+| `factor/marginalization_factor.h/.cpp` | `ResidualBlockInfo`、`MarginalizationInfo` 和 Schur 先验 |
+| `information_evaluator.*` / `adaptive_policy.*` | 信息评价、权重、关键帧、窗口和边缘化策略 |
+| `temporal_associator.*` | 有限时间门限下的最近邻关联 |
+| `adaptive_window_backend.h` | 兼容原桥接层的薄适配器，算法实现全部位于 Estimator |
+| `fast_livo_bridge.*` | ROS 参数、patch 导出、相机/图像回调、诊断和发布 |
 
-不再增加“每帧前端位姿测量因子”，不再用重投影伪观测替代缺失的光度量测。
-前端位姿用于初始化、数据关联和自适应统计；只有首次导航状态锚定先验、外参先验和
-边缘化先验进入目标函数。已删除不再使用的 `linear_factor.h/.cpp`。
+前端位姿同时用作新状态初值和可配置的正则参考，以实现滤波轨迹附近的局部微调。
+它与四类传感器残差复用了观测，**不被解释为独立的位姿测量**，其尺度不是前端滤波协方差。
+同一节点的 LIO/VIO 更新替换一份参考，不重复叠加；优化结果也不会覆盖参考快照。
+关闭该项后保留首次位姿锚定、初始速度/偏置和外参先验，以及边缘化先验。
 
 ## 2. 状态、坐标系和目标函数
 
@@ -50,7 +58,7 @@ Ceres 使用与 VINS 类似的存储布局：
 
 \[
 \min_{\{x_i\},T_{CI},\{\rho_a\}}
- \|r_{\rm prior}\|^2+
+ \|r_{\rm prior}\|^2+\lambda_F\sum_i\|r_{F,i}\|^2+
  \sum \|r_I\|^2+
  \sum w_L\,\mathcal H(\|r_L\|^2)+
  \sum w_V c_V\,\mathcal H(\|r_V\|^2)+
@@ -70,7 +78,8 @@ r_L=\frac{n_W^\top(R_{WI_i}(R_{IL}p_L+t_{IL})+p_{WI_i}-c_W)}{\sigma_L}.
 
 使用 FAST-LIVO2 的 `ptpl_list_`、地图平面以及测量/平面不确定性加权形式。
 `point_b_` 按原前端定义是去畸变后的 LiDAR 系点。
-窗口内固定平面关联及其方差，但每次 Ceres 迭代重新计算变换和残差；没有重复添加前端位姿先验。
+窗口内固定平面关联及其方差，但每次 Ceres 迭代重新计算变换和残差。
+每个状态的前端位姿正则另行维护一份，与本点面因子分开。
 本版本未在后端迭代中重新查体素地图或重新去畸变。
 
 ### 2.2 视觉光度 patch
@@ -151,6 +160,41 @@ r_X=\frac{n_L^\top(P_L-c_L)}{\sigma_X}.
 避免向 Ceres 重复传同一个参数块。其位姿约束通过后续跨帧光度因子产生。
 本版本不优化平面法向，也没有实现完整 patch 表面法向对齐因子。
 
+### 2.5 FAST-LIVO2 位姿正则与接受检查
+
+记前端快照为 \((\bar p_i,\bar q_i)\)，则
+
+\[
+r_{F,i} =
+\begin{bmatrix}
+(p_i-\bar p_i)/\sigma_{p,F}\\
+\operatorname{Log}(\bar q_i^{-1}q_i)/\sigma_{R,F}
+\end{bmatrix},\qquad
+\lambda_F=\texttt{frontend_pose_prior_weight}.
+\]
+
+这里的 Log 返回旋转向量，\(\sigma_{R,F}\) 在残差中使用弧度。默认
+\(\sigma_{p,F}=0.05\) m、\(\sigma_{R,F}=1^\circ\)、\(\lambda_F=1\)。
+每个已接纳状态一个 6 维正则项，不使用 Huber；权重独立于 LiDAR/视觉的自适应权重，
+不参与信息量评价，避免把该人为正则当成新增传感器信息。有效尺度为
+\(\sigma_F/\sqrt{\lambda_F}\)，减小尺度或增加权重会更贴近滤波结果。
+这些默认值是可调起点，尚未通过数据集标定。
+
+新状态由 FAST-LIVO2 初始化；同一时刻的视觉更新替换参考并更新该状态的位姿初值；
+其他保留状态延续上次优化结果作为热启动。启用正则时，首次状态先验的前 6 维置零，
+仅保留速度和偏置约束，避免额外重复锚定首次位姿。被移除帧的正则随关联因子一起
+吸收到 Schur 先验中，存活帧的正则继续保持非线性。
+
+软正则本身不构成硬界限，因此在 Ceres 求解后、写回状态前，检查整个窗口相对前端
+快照的修正幅度：默认平移不超过 0.20 m、转角不超过 5°。超限则恢复本次求解前的
+参数，拒绝结果；上层随后按已有恢复流程清空后端图，保留 IMU 缓冲，等待下一次输入。
+前端照常运行。该策略是求解结果的接受检查，不是带硬边界的约束优化或自动缩放修正。
+
+设置 `frontend_pose_prior_enabled: false` 同时关闭逐帧正则和这两个修正幅度门限，
+恢复首次状态位姿锚定；新状态仍使用滤波初值。消融时应固定数据与其他配置，同时报告
+该开关、正则尺度、拒绝次数和修正幅度。强正则会限制对前端漂移的修正能力；
+本实现不能据此宣称统计一致性或必然提高 ATE/RPE。
+
 ## 3. 时间关联、自适应和边缘化
 
 后端使用图像时刻与**保留的 LiDAR 帧**做最近邻匹配，满足
@@ -206,7 +250,9 @@ ctest --test-dir build-aw --output-on-failure
 测试覆盖：流形正负运算和 Jacobian、静止预积分与重力符号、偏置重积分、
 缺失端点/重复时间/IMU 间断拒绝、四类残差切空间数值差分、
 中间帧/最旧帧边缘化、参考帧与深度共同淘汰、同步与异步合成轨迹、
-重复图像不重复建因子以及窗口上界。
+重复图像不重复建因子以及窗口上界；另覆盖位姿正则 Jacobian、四元数符号不变性、
+同一时刻参考替换、正则强度的一维解析解、开关、平移/旋转超限拒绝和状态回滚。
+这些是测试源代码中的检查项，当前环境尚未执行 C++ 测试。
 
 ### 再编译 ROS 集成
 
@@ -232,7 +278,7 @@ roslaunch fast_livo mapping_avia_adaptive.launch feedback:=false
   本版不输出可信的后端协方差；不要将默认零 covariance 当成确定性。
 - `/adaptive_window/camera_imu_extrinsic`：parent=imu、child=camera_adaptive，
   消息内容为 \(T_{IC}\)，内部优化变量为其逆 \(T_{CI}\)。只是消息，不自动发布 TF。
-- `/adaptive_window/diagnostics`：Float64MultiArray，前 11 项保持原字段顺序。
+- `/adaptive_window/diagnostics`：Float64MultiArray，前 17 项保持此前 Ceres 版本的字段顺序。
 
 | 索引 | 含义 |
 |---|---|
@@ -243,9 +289,13 @@ roslaunch fast_livo mapping_avia_adaptive.launch feedback:=false
 | 9–10 | 相机–IMU 外参相对初值的平移 m、转角 deg |
 | 11–13 | 存活 LiDAR 因子块数、视觉 patch 因子块数、IMU 因子块数 |
 | 14–16 | 最近一次求解成功标志、累计拒绝 IMU 区间数、累计后端 reset 数 |
+| 17 | 存活前端位姿正则因子数，启用时等于窗口状态数 |
+| 18–19 | 最近一次有限求解结果相对前端快照的窗口最大平移 m、最大转角 deg（边缘化前） |
+| 20 | 累计因修正超限被拒绝的求解次数 |
 
 因子块数不是残差标量数；已经吸收到先验中的历史因子不再计入各类存活计数。
 首次 patch 只有几何约束，第二个可用关键帧观测才产生光度因子；检查 index 12 是否实际非零。
+超限恢复后保留 index 18–20，index 14 为失败，窗口与存活因子数为零。
 某次输入未选为关键帧时诊断保留上次求解状态，不代表本次输入触发了求解。
 
 ## 6. 数据集验证顺序及方法边界
@@ -255,7 +305,8 @@ roslaunch fast_livo mapping_avia_adaptive.launch feedback:=false
 1. 原 FAST-LIVO2 对照；固定窗口/固定权重、固定外参的 Ceres 后端；
 2. 同配置加入光度，再加入 patch–平面因子，确认计数及约束实际生效；
 3. 分别启用权重、关键帧、窗口、边缘化自适应，并组合测试；
-4. 最后加入外参优化，报告不同初值、退化运动和充分激励下的收敛/失败情况。
+4. 在一致配置上开启/关闭前端位姿正则，比较修正幅度、拒绝率和轨迹精度；
+5. 最后加入外参优化，报告不同初值、退化运动和充分激励下的收敛/失败情况。
 
 `max_cross_modal_factors=0` 同时关闭 patch 生命周期及其两类因子，不是只关闭几何因子的
 独立视觉消融开关。严格消融需保留一致的参考 patch/深度初始化规则并控制因子创建路径，
@@ -267,7 +318,7 @@ roslaunch fast_livo mapping_avia_adaptive.launch feedback:=false
 仍待研究/实现的内容：
 
 - 去畸变、数据关联、地图和光度参考由前端提供，彼此及 LiDAR/跨模态复用点之间存在相关性。
-  当前忽略联合相关协方差；移除逐帧位姿伪因子不等于已经证明估计器一致性。
+  当前忽略联合相关协方差；逐帧位姿项明确作为相关正则使用，并未证明估计器一致性。
 - 地图平面、patch 法向及关联在因子存活期间固定；没有后端地图更新或在线重关联。
 - scan-local 平面只使用前端点面匹配的 LiDAR 内点，低密度/非平面环境可能无法建立 patch。
 - 图像只有一级 4×4 稀疏采样；没有后端多尺度追踪、曝光优化或显式遮挡检测。

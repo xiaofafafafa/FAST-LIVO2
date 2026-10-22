@@ -26,7 +26,8 @@ enum class Modality
   kImu,
   kLidar,
   kVision,
-  kCrossModal
+  kCrossModal,
+  kFrontendPose
 };
 
 inline const char *ToString(Modality modality)
@@ -38,6 +39,7 @@ inline const char *ToString(Modality modality)
     case Modality::kLidar: return "lidar";
     case Modality::kVision: return "vision";
     case Modality::kCrossModal: return "cross_modal";
+    case Modality::kFrontendPose: return "frontend_pose";
   }
   return "unknown";
 }
@@ -194,6 +196,15 @@ struct AdaptiveWindowConfig
   double min_inverse_depth = 0.005;
   double max_inverse_depth = 5.0;
 
+  // Correlated regularization around FAST-LIVO2, not calibrated covariance.
+  bool frontend_pose_prior_enabled = true;
+  double frontend_pose_translation_sigma = 0.05; // metres
+  double frontend_pose_rotation_deg = 1.0;
+  double frontend_pose_prior_weight = 1.0;
+  double frontend_pose_max_translation = 0.20; // reject the whole solve beyond this
+  double frontend_pose_max_rotation_deg = 5.0;
+
+  // First-state pose anchor used only when frontend_pose_prior_enabled is false.
   double pose_prior_translation_sigma = 0.08;
   double pose_prior_rotation_deg = 3.0;
   double velocity_prior_sigma = 0.30;
@@ -226,6 +237,10 @@ struct BackendDiagnostics
   std::size_t imu_factors = 0;
   std::size_t rejected_imu_intervals = 0;
   std::size_t reset_count = 0;
+  std::size_t frontend_pose_factors = 0;
+  std::size_t rejected_pose_refinements = 0;
+  double max_frontend_translation_correction = 0.0;
+  double max_frontend_rotation_correction_deg = 0.0;
   double camera_extrinsic_translation_change = 0.0;
   double camera_extrinsic_rotation_change_deg = 0.0;
 };

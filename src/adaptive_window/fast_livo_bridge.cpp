@@ -96,6 +96,12 @@ AdaptiveWindowConfig FastLivoBridge::LoadConfig(
                 &config.huber_delta_lidar);
   ReadParameter(node_handle, "huber_delta_cross_modal",
                 &config.huber_delta_cross_modal);
+  ReadParameter(node_handle, "frontend_pose_prior_enabled", &config.frontend_pose_prior_enabled);
+  ReadParameter(node_handle, "frontend_pose_translation_sigma", &config.frontend_pose_translation_sigma);
+  ReadParameter(node_handle, "frontend_pose_rotation_deg", &config.frontend_pose_rotation_deg);
+  ReadParameter(node_handle, "frontend_pose_prior_weight", &config.frontend_pose_prior_weight);
+  ReadParameter(node_handle, "frontend_pose_max_translation", &config.frontend_pose_max_translation);
+  ReadParameter(node_handle, "frontend_pose_max_rotation_deg", &config.frontend_pose_max_rotation_deg);
   ReadParameter(node_handle, "pose_prior_translation_sigma",
                 &config.pose_prior_translation_sigma);
   ReadParameter(node_handle, "pose_prior_rotation_deg",
@@ -504,7 +510,11 @@ void FastLivoBridge::Publish(const double timestamp) const
       static_cast<double>(diagnostics.imu_factors),
       diagnostics.solve_success ? 1.0 : 0.0,
       static_cast<double>(diagnostics.rejected_imu_intervals),
-      static_cast<double>(diagnostics.reset_count)};
+      static_cast<double>(diagnostics.reset_count),
+      static_cast<double>(diagnostics.frontend_pose_factors),
+      diagnostics.max_frontend_translation_correction,
+      diagnostics.max_frontend_rotation_correction_deg,
+      static_cast<double>(diagnostics.rejected_pose_refinements)};
   diagnostics_publisher_.publish(diagnostic_message);
 
   ExtrinsicState extrinsic = backend_->CameraExtrinsicEstimate();

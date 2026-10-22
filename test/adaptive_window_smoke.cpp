@@ -40,7 +40,7 @@ std::vector<double> Motion(const NavState &s) {
   return {s.v_w_i.x(), s.v_w_i.y(), s.v_w_i.z(),
           s.bias_a.x(), s.bias_a.y(), s.bias_a.z(), s.bias_g.x(), s.bias_g.y(), s.bias_g.z()};
 }
-Eigen::VectorXd Residual(const NonlinearFactor &f, const std::vector<std::vector<double>> &blocks) {
+Eigen::VectorXd Residual(const ResidualBlockInfo &f, const std::vector<std::vector<double>> &blocks) {
   Require(bool(f.cost), "null cost");
   std::vector<const double *> pointers;
   for (const auto &b : blocks) pointers.push_back(b.data());
@@ -51,7 +51,7 @@ Eigen::VectorXd Residual(const NonlinearFactor &f, const std::vector<std::vector
 }
 // Compare ambient autodiff * manifold PlusJacobian against central differences
 // in the actual tangent space; this catches quaternion ordering/half-angle bugs.
-void CheckJacobian(const NonlinearFactor &f, const std::vector<std::vector<double>> &blocks,
+void CheckJacobian(const ResidualBlockInfo &f, const std::vector<std::vector<double>> &blocks,
                    double tolerance = 2e-5) {
   const int rows = f.cost->num_residuals();
   std::vector<const double *> pointers;
@@ -64,7 +64,7 @@ void CheckJacobian(const NonlinearFactor &f, const std::vector<std::vector<doubl
   }
   Eigen::VectorXd r(rows);
   Require(f.cost->Evaluate(pointers.data(), r.data(), jp.data()), "jacobian evaluation");
-  PoseManifold manifold;
+  PoseLocalParameterization manifold;
   for (std::size_t k = 0; k < blocks.size(); ++k) {
     Eigen::MatrixXd analytic = j[k];
     if (f.keys[k].is_pose()) {
@@ -100,7 +100,7 @@ VisualPatchObservation Patch(std::uint64_t track, double x) {
   return o;
 }
 void TestManifold() {
-  PoseManifold manifold;
+  PoseLocalParameterization manifold;
   auto x = PackPose(Eigen::Vector3d(1, 2, 3), ExpQuaternion(Eigen::Vector3d(0.2, -0.1, 0.3)));
   std::array<double, 7> y;
   Eigen::Matrix<double, 6, 1> d, recovered;
@@ -123,31 +123,31 @@ void TestManifold() {
 }
 void TestPreintegrationAndFactors() {
   AdaptiveWindowConfig config;
-  auto pre = std::make_shared<ImuPreintegration>(config);
+  auto pre = std::make_shared<IntegrationBase>(config);
   const auto raw = Samples(-0.01, 1.01);
-  Require(pre->Integrate(raw, 0, 1, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()), "integration");
-  Require(std::abs(pre->dt - 1) < 1e-10, "integration duration");
-  Require((pre->dp - Eigen::Vector3d(0, 0, 4.905)).norm() < 1e-8, "midpoint position");
-  Require((pre->dv - Eigen::Vector3d(0, 0, 9.81)).norm() < 1e-8, "midpoint velocity");
+  Require(pre->integrate(raw, 0, 1, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()), "integration");
+  Require(std::abs(pre->sum_dt - 1) < 1e-10, "integration duration");
+  Require((pre->delta_p - Eigen::Vector3d(0, 0, 4.905)).norm() < 1e-8, "midpoint position");
+  Require((pre->delta_v - Eigen::Vector3d(0, 0, 9.81)).norm() < 1e-8, "midpoint velocity");
   Require((pre->covariance - pre->covariance.transpose()).norm() < 1e-10, "symmetric covariance");
   Require(pre->covariance.diagonal().minCoeff() > 0, "bias random-walk covariance");
   NavState a, b; b.timestamp = 1;
-  auto imu = FactorBuilders::Imu(1, 2, a.gravity_w, pre);
+  auto imu = FactorFactory::imu(1, 2, a.gravity_w, pre);
   std::vector<std::vector<double>> ib{PackPose(a.p_w_i, a.q_w_i), Motion(a), PackPose(b.p_w_i, b.q_w_i), Motion(b)};
   Require(Residual(imu, ib).norm() < 1e-6, "stationary gravity sign");
   ib[2] = PackPose(Eigen::Vector3d(0.03, 0.02, -0.01), ExpQuaternion(Eigen::Vector3d(0.01, 0.02, -0.03)));
   CheckJacobian(imu, ib);
-  ImuPreintegration invalid(config);
-  Require(!invalid.Integrate(raw, -0.02, 1, a.bias_a, a.bias_g), "missing start bracket");
-  Require(!invalid.Integrate(raw, 0, 1.02, a.bias_a, a.bias_g), "missing end bracket");
-  Require(!invalid.Integrate(Samples(0, 1, 0.2), 0, 1, a.bias_a, a.bias_g), "IMU gap rejection");
+  IntegrationBase invalid(config);
+  Require(!invalid.integrate(raw, -0.02, 1, a.bias_a, a.bias_g), "missing start bracket");
+  Require(!invalid.integrate(raw, 0, 1.02, a.bias_a, a.bias_g), "missing end bracket");
+  Require(!invalid.integrate(Samples(0, 1, 0.2), 0, 1, a.bias_a, a.bias_g), "IMU gap rejection");
   auto duplicate = raw; duplicate.insert(duplicate.begin() + 1, duplicate.front());
-  Require(!invalid.Integrate(duplicate, 0, 1, a.bias_a, a.bias_g), "duplicate time rejection");
-  const auto base_dp = pre->dp;
+  Require(!invalid.integrate(duplicate, 0, 1, a.bias_a, a.bias_g), "duplicate time rejection");
+  const auto base_dp = pre->delta_p;
   Eigen::Vector3d delta_ba(0.01, -0.02, 0.03);
   const Eigen::Vector3d predicted = base_dp + pre->jacobian.block<3, 3>(0, 9) * delta_ba;
-  Require(pre->Repropagate(delta_ba, Eigen::Vector3d::Zero()), "bias repropagation");
-  Require((pre->dp - predicted).norm() < 1e-8, "bias correction vs repropagation");
+  Require(pre->repropagate(delta_ba, Eigen::Vector3d::Zero()), "bias repropagation");
+  Require((pre->delta_p - predicted).norm() < 1e-8, "bias correction vs repropagation");
 
   const auto pose = PackPose(Eigen::Vector3d(0.1, 0.2, 0.3), ExpQuaternion(Eigen::Vector3d(0.1, -0.05, 0.03)));
   const auto other = PackPose(Eigen::Vector3d(0.15, 0.1, 0.25), ExpQuaternion(Eigen::Vector3d(-0.04, 0.02, 0.06)));
@@ -159,51 +159,57 @@ void TestPreintegrationAndFactors() {
   observation.point_l = Eigen::Vector3d(0.1, 0.2, 4);
   observation.normal_w = Eigen::Vector3d(0.1, 0.2, 1).normalized();
   observation.center_w = Eigen::Vector3d(0, 0, 4);
-  CheckJacobian(FactorBuilders::Lidar(1, lidar, observation, 2), {pose});
+  CheckJacobian(FactorFactory::lidar(1, lidar, observation, 2), {pose});
   auto patch = Patch(1, 0);
   patch.normal_c = Eigen::Vector3d(0.1, -0.2, 1).normalized();
-  CheckJacobian(FactorBuilders::Photometric(1, 2, 1, patch, 1.1, Projection(), Image(), 3, 1),
+  CheckJacobian(FactorFactory::photometric(1, 2, 1, patch, 1.1, Projection(), Image(), 3, 1),
                 {pose, other, extrinsic, {0.25}});
   LocalPlane plane; plane.center_l = Eigen::Vector3d(0, 0, 4);
-  CheckJacobian(FactorBuilders::PatchPlane(1, 2, 1, patch.center_ray, lidar, plane, 3, 1),
+  CheckJacobian(FactorFactory::patchPlane(1, 2, 1, patch.center_ray, lidar, plane, 3, 1),
                 {pose, other, extrinsic, {0.25}});
-  CheckJacobian(FactorBuilders::PatchPlane(1, 1, 1, patch.center_ray, lidar, plane, 3, 1),
+  CheckJacobian(FactorFactory::patchPlane(1, 1, 1, patch.center_ray, lidar, plane, 3, 1),
                 {extrinsic, {0.25}});
-  CheckJacobian(FactorBuilders::InitialState(1, a, config), {pose, Motion(a)});
-  CheckJacobian(FactorBuilders::ExtrinsicPrior(ext, config), {extrinsic});
+  CheckJacobian(FactorFactory::initialState(1, a, config), {pose, Motion(a)});
+  const auto anchor = FactorFactory::frontendPose(1, a, config);
+  CheckJacobian(anchor, {pose});
+  Require(Residual(anchor, {PackPose(a.p_w_i, a.q_w_i)}).norm() < 1e-12, "frontend reference residual");
+  auto antipodal = PackPose(a.p_w_i, a.q_w_i);
+  for (int k = 3; k < 7; ++k) antipodal[k] *= -1;
+  Require(Residual(anchor, {antipodal}).norm() < 1e-12, "quaternion sign invariance");
+  CheckJacobian(FactorFactory::extrinsicPrior(ext, config), {extrinsic});
 }
 void TestMarginalization() {
   AdaptiveWindowConfig c; c.solver_time_limit = 1;
-  FixedLagOptimizer optimizer(c); optimizer.Reset(ExtrinsicState());
-  optimizer.AddFactor(FactorBuilders::ExtrinsicPrior(ExtrinsicState(), c));
+  Estimator optimizer(c); optimizer.setParameter(LidarExtrinsic(), ExtrinsicState());
   NavState state;
-  const auto first = optimizer.AddNode(state);
-  Require(optimizer.AddFactor(FactorBuilders::InitialState(first, state, c)), "initial prior");
+  const auto first = optimizer.addFrame(state);
+  Require(optimizer.addResidualBlock(FactorFactory::initialState(first, state, c)), "initial prior");
   auto previous = first;
   for (int i = 1; i < 4; ++i) {
     state.timestamp = 0.1 * i;
-    const auto current = optimizer.AddNode(state);
-    auto pre = std::make_shared<ImuPreintegration>(c);
-    Require(pre->Integrate(Samples(0.1 * (i - 1) - 0.01, state.timestamp + 0.01),
+    const auto current = optimizer.addFrame(state);
+    auto pre = std::make_shared<IntegrationBase>(c);
+    Require(pre->integrate(Samples(0.1 * (i - 1) - 0.01, state.timestamp + 0.01),
         0.1 * (i - 1), state.timestamp, state.bias_a, state.bias_g), "marginal IMU");
-    Require(optimizer.AddFactor(FactorBuilders::Imu(previous, current, state.gravity_w, pre)), "IMU factor");
+    Require(optimizer.addResidualBlock(FactorFactory::imu(previous, current, state.gravity_w, pre)), "IMU factor");
     previous = current;
   }
-  Require(optimizer.AddDepth(99, 2, 0.25), "landmark depth");
+  Require(optimizer.addFeature(99, 2, 0.25), "landmark depth");
   LocalPlane plane; plane.center_l.z() = 4;
-  Require(optimizer.AddFactor(FactorBuilders::PatchPlane(2, 2, 99, Eigen::Vector3d::UnitZ(),
+  Require(optimizer.addResidualBlock(FactorFactory::patchPlane(2, 2, 99, Eigen::Vector3d::UnitZ(),
       LidarExtrinsic(), plane, 3, 1)), "landmark plane");
   double before = 0, after = 0;
-  Require(optimizer.Solve(&before), "solve before marginalization");
-  Require(optimizer.Marginalize(2), "middle-frame Schur marginalization");
-  Require(!optimizer.HasDepth(99), "anchor/depth removed together");
-  Require(optimizer.Solve(&after), "solve after middle marginalization");
-  Require(after < 1e-6 && optimizer.NumNodes() == 3, "Schur zero residual preservation");
-  Require(optimizer.CountFactors(Modality::kImu) == 1, "only touching IMU factors absorbed");
-  Require(optimizer.Marginalize(first), "oldest-frame marginalization with existing prior");
-  Require(optimizer.Solve(&after), "solve after oldest marginalization");
-  Require(!optimizer.Marginalize(previous), "newest state protected");
-  Require(optimizer.NumNodes() == 2, "bounded node count");
+  Require(optimizer.optimization(&before), "solve before marginalization");
+  Require(optimizer.marginalizeFrame(2), "middle-frame Schur marginalization");
+  Require(!optimizer.hasFeature(99), "anchor/depth removed together");
+  Require(optimizer.optimization(&after), "solve after middle marginalization");
+  Require(after < 1e-6 && optimizer.numFrames() == 3, "Schur zero residual preservation");
+  Require(optimizer.countFactors(Modality::kImu) == 1, "only touching IMU factors absorbed");
+  Require(optimizer.marginalizeFrame(first), "oldest-frame marginalization with existing prior");
+  Require(optimizer.optimization(&after), "solve after oldest marginalization");
+  Require(!optimizer.marginalizeFrame(previous), "newest state protected");
+  Require(optimizer.numFrames() == 2, "bounded node count");
+  Require(optimizer.countFactors(Modality::kFrontendPose) == 2, "only retained frontend priors remain");
 }
 void TestBackend(bool asynchronous) {
   AdaptiveWindowConfig c;
@@ -234,6 +240,8 @@ void TestBackend(bool asynchronous) {
     Require(d.reset_count == 0 && d.rejected_imu_intervals == 0, "unexpected recovery or IMU rejection");
     Require(d.window_size <= static_cast<std::size_t>(c.max_window_size), "window bound");
     Require(d.lidar_factors > 0, "missing lidar factors");
+    Require(d.frontend_pose_factors == d.window_size, "one frontend pose factor per state");
+    Require(d.rejected_pose_refinements == 0, "unexpected refinement rejection");
     saw_photo = saw_photo || d.vision_factors > 0;
     saw_plane = saw_plane || d.cross_modal_pairs > 0;
     saw_marginalization = saw_marginalization || d.last_marginalized_id != 0;
@@ -250,10 +258,81 @@ void TestBackend(bool asynchronous) {
   Require(!backend.ProcessLidar(s, summary, {}), "unbracketed IMU must not create a node");
   Require(backend.diagnostics().rejected_imu_intervals == 1, "IMU rejection diagnostic");
 }
+
+void TestFrontendPoseRefinement() {
+  AdaptiveWindowConfig c; c.solver_time_limit = 1;
+  Estimator estimator(c);
+  NavState frontend;
+  const auto id = estimator.addFrame(frontend);
+  Require(estimator.addResidualBlock(FactorFactory::initialState(id, frontend, c)), "motion prior");
+  Require(!estimator.addResidualBlock(FactorFactory::frontendPose(id, frontend, c)), "duplicate pose-prior API blocked");
+  LidarPlaneObservation lidar; lidar.normal_w = Eigen::Vector3d::UnitX();
+  lidar.center_w = Eigen::Vector3d(0.1, 0, 0); lidar.variance = 0.01;
+  Require(estimator.addResidualBlock(FactorFactory::lidar(id, LidarExtrinsic(), lidar, 0)), "conflicting lidar residual");
+  Require(estimator.optimization(), "regularized refinement solve");
+  // Independent 1-D solution: (400 * 0 + 100 * 0.1) / (400 + 100).
+  Require(std::abs(estimator.stateEstimate(id).p_w_i.x() - 0.02) < 1e-6, "soft refinement strength");
+  Require(estimator.optimization(), "repeated refinement solve");
+  Require(std::abs(estimator.stateEstimate(id).p_w_i.x() - 0.02) < 1e-6, "frontend reference must not follow backend");
+
+  frontend.p_w_i.x() = 0.03;
+  Require(estimator.updateFrontendPose(id, frontend), "same-state pose replacement");
+  Require(estimator.countFactors(Modality::kFrontendPose) == 1, "pose replacement must not stack");
+  Require(estimator.optimization(), "solve after pose replacement");
+  Require(std::abs(estimator.stateEstimate(id).p_w_i.x() - 0.044) < 1e-6, "latest frontend reference used");
+
+  AdaptiveWindowConfig off = c; off.frontend_pose_prior_enabled = false;
+  Estimator unregularized(off);
+  const auto first = unregularized.addFrame(frontend);
+  Require(unregularized.countFactors(Modality::kFrontendPose) == 0, "pose-prior switch");
+  auto displaced = PackPose(frontend.p_w_i + Eigen::Vector3d(0.1, 0, 0), frontend.q_w_i);
+  Require(Residual(FactorFactory::initialState(first, frontend, off), {displaced, Motion(frontend)}).head<6>().norm() > 0,
+          "first-pose gauge anchor when regularization disabled");
+  Require(Residual(FactorFactory::initialState(first, frontend, c), {displaced, Motion(frontend)}).head<6>().norm() == 0,
+          "no duplicate initial-pose constraint when regularization enabled");
+
+  // A deliberately tight acceptance gate rejects a mathematically valid solve.
+  AdaptiveWindowConfig tight = c; tight.frontend_pose_max_translation = 0.005;
+  Estimator guarded(tight);
+  NavState zero; const auto guarded_id = guarded.addFrame(zero);
+  Require(guarded.addResidualBlock(FactorFactory::initialState(guarded_id, zero, tight)), "guard motion prior");
+  Require(guarded.addResidualBlock(FactorFactory::lidar(guarded_id, LidarExtrinsic(), lidar, 0)), "guard lidar");
+  Require(!guarded.optimization(), "excessive refinement rejected");
+  Require(guarded.stateEstimate(guarded_id).p_w_i.norm() < 1e-12, "rejected result not committed");
+  Require(guarded.diagnostics().rejected_pose_refinements == 1, "rejection counter");
+  Require(!guarded.optimization(), "repeat solve still uses original state/reference");
+  Require(guarded.diagnostics().rejected_pose_refinements == 2, "repeat rejection counter");
+
+  AdaptiveWindowConfig turn = c; turn.frontend_pose_translation_sigma = 1e-4;
+  Estimator rotation_guard(turn);
+  const auto turn_id = rotation_guard.addFrame(NavState());
+  Require(rotation_guard.addResidualBlock(FactorFactory::initialState(turn_id, NavState(), turn)), "rotation motion prior");
+  LidarPlaneObservation turn_lidar;
+  turn_lidar.point_l = Eigen::Vector3d::UnitX(); turn_lidar.normal_w = Eigen::Vector3d::UnitY();
+  turn_lidar.center_w.y() = std::sin(Radians(10.0)); turn_lidar.variance = 1e-8;
+  Require(rotation_guard.addResidualBlock(FactorFactory::lidar(turn_id, LidarExtrinsic(), turn_lidar, 0)), "rotation lidar");
+  Require(!rotation_guard.optimization(), "rotation correction gate");
+  Require(rotation_guard.diagnostics().max_frontend_rotation_correction_deg > turn.frontend_pose_max_rotation_deg,
+          "rotation gate reports degrees");
+  Require(rotation_guard.stateEstimate(turn_id).q_w_i.angularDistance(Eigen::Quaterniond::Identity()) < 1e-12,
+          "rejected rotation not committed");
+
+  // Exercise actual bridge-compatible event order, rather than only graph APIs.
+  AdaptiveWindowBackend backend(c);
+  backend.Initialize(LidarExtrinsic(), ExtrinsicState(), Projection());
+  MeasurementSummary summary;
+  Require(backend.ProcessLidar(zero, summary, {}), "LIO pose admission");
+  zero.p_w_i.x() = 0.04;
+  Require(backend.ProcessVision(zero, summary, {}, Image()), "same-time VIO pose update");
+  NavState refined; Require(backend.LatestEstimate(&refined), "same-time output");
+  Require(std::abs(refined.p_w_i.x() - 0.04) < 1e-6, "latest VIO pose is reference");
+  Require(backend.diagnostics().frontend_pose_factors == 1 && backend.diagnostics().window_size == 1,
+          "same-time LIO/VIO keep one pose anchor");
+}
 }
 int main() {
   try {
-    TestManifold(); TestPreintegrationAndFactors(); TestMarginalization();
+    TestManifold(); TestPreintegrationAndFactors(); TestMarginalization(); TestFrontendPoseRefinement();
     TestBackend(false); TestBackend(true);
     std::cout << "All Ceres adaptive-window checks passed.\n";
     return 0;

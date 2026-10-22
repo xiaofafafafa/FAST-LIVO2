@@ -46,6 +46,16 @@ adaptive_window:
   huber_delta_vision: 3.0
   huber_delta_cross_modal: 3.0
 
+  # Regularization around the filter pose; these are tuning scales, not
+  # independent sensor covariance. One prior per state; same-time VIO replaces LIO.
+  frontend_pose_prior_enabled: true
+  frontend_pose_translation_sigma: 0.05
+  frontend_pose_rotation_deg: 1.0
+  frontend_pose_prior_weight: 1.0
+  frontend_pose_max_translation: 0.20
+  frontend_pose_max_rotation_deg: 5.0
+
+  # First-state pose anchor only when the frontend pose prior is disabled.
   pose_prior_translation_sigma: 0.08
   pose_prior_rotation_deg: 3.0
   velocity_prior_sigma: 0.30

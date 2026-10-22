@@ -1,12 +1,12 @@
 # Shared by the catkin build and the dependency-light standalone test build.
 add_library(adaptive_window_core
-  src/adaptive_window/imu_preintegration.cpp
+  src/adaptive_window/factor/integration_base.cpp
   src/adaptive_window/information_evaluator.cpp
   src/adaptive_window/adaptive_policy.cpp
   src/adaptive_window/temporal_associator.cpp
-  src/adaptive_window/fixed_lag_optimizer.cpp
-  src/adaptive_window/factor_builders.cpp
-  src/adaptive_window/adaptive_window_backend.cpp
+  src/adaptive_window/factor/marginalization_factor.cpp
+  src/adaptive_window/factor/factor_factory.cpp
+  src/adaptive_window/estimator.cpp
 )
 target_include_directories(adaptive_window_core PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(adaptive_window_core PUBLIC Eigen3::Eigen Ceres::ceres)

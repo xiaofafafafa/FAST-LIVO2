@@ -9,6 +9,9 @@
 > This research branch has **not yet been compiled or dataset-validated**.
 > It runs in shadow mode (no state/covariance/map feedback). Start with the
 > standalone tests in the integration guide before running ROS datasets.
+> The backend now follows VINS-style `Estimator` / `factor/` naming and includes
+> configurable regularization around FAST-LIVO2 filter poses. See
+> [`docs/VINS_STYLE_BACKEND.md`](docs/VINS_STYLE_BACKEND.md) for the code map.
 
 ## FAST-LIVO2: Fast, Direct LiDAR-Inertial-Visual Odometry
 
