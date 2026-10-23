@@ -1,3 +1,8 @@
+/**
+ * @file fast_livo_bridge.cpp
+ * @brief 读取 ROS 参数、导出点面/原始 patch 观测并发布后端结果；当前无状态/协方差/地图反馈。
+ * 中文框架说明：docs/ADAPTIVE_WINDOW_CODE_GUIDE_CN.md。
+ */
 #include "adaptive_window/fast_livo_bridge.h"
 
 #include "adaptive_window/math_utils.h"
@@ -16,6 +21,7 @@ namespace adaptive_window
 namespace
 {
 
+// 所有 ROS 参数统一加 adaptive_window/ 前缀；NodeHandle 未找到时沿用结构体默认值。
 template <typename T>
 void ReadParameter(ros::NodeHandle &node_handle, const std::string &name,
                    T *value)
@@ -23,11 +29,14 @@ void ReadParameter(ros::NodeHandle &node_handle, const std::string &name,
   node_handle.param<T>("adaptive_window/" + name, *value, *value);
 }
 
+// 对 CV_8UC1 原始灰度图双线性采样，保留边界以便后续安全求梯度。
+// 只提供采样值；与其一致的解析梯度在 ProcessVision 的回调中计算。
 bool BilinearIntensity(const cv::Mat &image, const Eigen::Vector2d &pixel,
                        double *intensity)
 {
   if (intensity == nullptr || !pixel.allFinite() || image.empty() || image.type() != CV_8UC1)
     return false;
+  // 以像素左上角和小数部分构造四邻域插值，不能先取整再当作直接法量测。
   const int x = static_cast<int>(std::floor(pixel.x()));
   const int y = static_cast<int>(std::floor(pixel.y()));
   if (x < 1 || y < 1 || x + 2 >= image.cols || y + 2 >= image.rows)
@@ -46,6 +55,7 @@ bool BilinearIntensity(const cv::Mat &image, const Eigen::Vector2d &pixel,
 
 }  // namespace
 
+// 将 YAML/参数服务器字段映射到核心配置，保证核心不依赖 ROS 参数 API。
 AdaptiveWindowConfig FastLivoBridge::LoadConfig(
     ros::NodeHandle &node_handle)
 {
@@ -96,6 +106,7 @@ AdaptiveWindowConfig FastLivoBridge::LoadConfig(
                 &config.huber_delta_lidar);
   ReadParameter(node_handle, "huber_delta_cross_modal",
                 &config.huber_delta_cross_modal);
+  // 独立滤波位姿正则及接受门限；这些尺度不是读取的前端滤波协方差。
   ReadParameter(node_handle, "frontend_pose_prior_enabled", &config.frontend_pose_prior_enabled);
   ReadParameter(node_handle, "frontend_pose_translation_sigma", &config.frontend_pose_translation_sigma);
   ReadParameter(node_handle, "frontend_pose_rotation_deg", &config.frontend_pose_rotation_deg);
@@ -130,6 +141,7 @@ AdaptiveWindowConfig FastLivoBridge::LoadConfig(
   ReadParameter(node_handle, "bias_prior_sigma", &config.bias_prior_sigma);
   ReadParameter(node_handle, "information_eigen_floor", &config.information_eigen_floor);
 
+  // 在桥接层修正基本窗口计数范围，其余正数/有限性等约束由 Estimator 构造器检查。
   config.min_window_size = std::max(2, config.min_window_size);
   config.max_window_size =
       std::max(config.min_window_size, config.max_window_size);
@@ -139,12 +151,14 @@ AdaptiveWindowConfig FastLivoBridge::LoadConfig(
   return config;
 }
 
+// 前端已具备有效相机与标定后创建后端；本类不另做传感器初始化或重新估计重力。
 FastLivoBridge::FastLivoBridge(ros::NodeHandle &node_handle,
                                const M3D &rotation_i_l,
                                const V3D &translation_i_l,
                                const VIOManagerPtr &vio_manager)
     : config_(LoadConfig(node_handle))
 {
+  // rotation_i_l / translation_i_l 来自前端 LiDAR→IMU 固定标定。
   lidar_extrinsic_.q_i_l =
       Eigen::Quaterniond(rotation_i_l).normalized();
   lidar_extrinsic_.p_i_l = translation_i_l;
@@ -161,10 +175,12 @@ FastLivoBridge::FastLivoBridge(ros::NodeHandle &node_handle,
     return;
   }
 
+  // 前端 Rci/Pci 的方向为 IMU→相机，直接作为内部优化 T_CI 初值。
   camera_extrinsic_initial_.q_c_i =
       Eigen::Quaterniond(vio_manager->Rci).normalized();
   camera_extrinsic_initial_.p_c_i = vio_manager->Pci;
 
+  // 将具体 Vikit 相机封装成核心可调用的投影接口，避免因子依赖相机实现类型。
   ProjectionFunction projection =
       [camera = vio_manager->cam, border = vio_manager->border](
           const Eigen::Vector3d &point, Eigen::Vector2d *pixel,
@@ -175,6 +191,7 @@ FastLivoBridge::FastLivoBridge(ros::NodeHandle &node_handle,
         if (!pixel->allFinite() ||
             !camera->isInFrame(pixel->cast<int>(), border))
           return false;
+        // 对 Vikit 投影作中心差分得到 2×3 Jacobian，后续位姿/深度链由 AutoDiff 处理。
         const double epsilon = 1.0e-6;
         for (int column = 0; column < 3; ++column)
         {
@@ -189,9 +206,11 @@ FastLivoBridge::FastLivoBridge(ros::NodeHandle &node_handle,
 
   // State-only feedback cannot consistently update the frontend covariance/map.
   // Keep this research backend in shadow mode until that transfer is designed.
+  // 只回写位姿会使滤波协方差、地图及历史信息不一致，当前统一输出独立后端结果。
   if (config_.feedback_enabled)
     ROS_WARN("Ceres backend: feedback_enabled is ignored; covariance-consistent feedback is not implemented.");
   config_.feedback_enabled = false;
+  // 配置非法时禁用后端并提示，前端原流程仍可继续。
   try { backend_.reset(new AdaptiveWindowBackend(config_)); }
   catch (const std::invalid_argument &error) {
     ROS_ERROR("Invalid adaptive-window configuration: %s", error.what());
@@ -200,6 +219,7 @@ FastLivoBridge::FastLivoBridge(ros::NodeHandle &node_handle,
   backend_->Initialize(lidar_extrinsic_, camera_extrinsic_initial_,
                        std::move(projection));
 
+  // 三个 topic 分别提供里程计、数值诊断和相机—IMU 外参；没有隐式前端反馈通道。
   odometry_publisher_ = node_handle.advertise<nav_msgs::Odometry>(
       "/adaptive_window/odometry", 20);
   diagnostics_publisher_ =
@@ -212,6 +232,7 @@ FastLivoBridge::FastLivoBridge(ros::NodeHandle &node_handle,
            config_.min_window_size, config_.max_window_size);
 }
 
+// 状态快照转换：世界系姿态/位置/速度、IMU 偏置与已初始化重力；不修改原滤波对象。
 NavState FastLivoBridge::ToNavState(const double timestamp,
                                     const StatesGroup &state)
 {
@@ -226,6 +247,7 @@ NavState FastLivoBridge::ToNavState(const double timestamp,
   return result;
 }
 
+// 同时构建两份用途不同的数据：策略用 6×6 信息统计，优化用原始点面观测。
 MeasurementSummary FastLivoBridge::BuildLidarSummary(
     const double timestamp, const StatesGroup &state,
     const std::vector<PointToPlane> &planes,
@@ -241,6 +263,7 @@ MeasurementSummary FastLivoBridge::BuildLidarSummary(
   double squared_error = 0.0;
   for (const PointToPlane &plane : planes)
   {
+    // 原始点为去畸变后的 LiDAR 系坐标，先经固定 T_IL 再经本次滤波 T_WI。
     const Eigen::Vector3d point_i =
         lidar_extrinsic_.q_i_l * plane.point_b_ +
         lidar_extrinsic_.p_i_l;
@@ -248,9 +271,11 @@ MeasurementSummary FastLivoBridge::BuildLidarSummary(
     const Eigen::Matrix3d point_cross = Skew(point_i);
     const Eigen::Vector3d rotation_jacobian =
         point_cross * state.rot_end.transpose() * plane.normal_;
+    // 前端统计沿用 [旋转,平移] 列顺序；此矩阵不能直接当作 Ceres [平移,旋转] Jacobian。
     Eigen::Matrix<double, 1, kPoseDim> jacobian;
     jacobian << rotation_jacobian.transpose(), plane.normal_.transpose();
 
+    // 传播平面参数不确定性，并将点协方差旋转到世界系；此方差在因子存活期间固定。
     Eigen::Matrix<double, 1, 6> plane_jacobian;
     plane_jacobian.block<1, 3>(0, 0) = point_w - plane.center_;
     plane_jacobian.block<1, 3>(0, 3) = -plane.normal_;
@@ -259,6 +284,7 @@ MeasurementSummary FastLivoBridge::BuildLidarSummary(
         plane.body_cov_ *
         (state.rot_end * lidar_extrinsic_.q_i_l.toRotationMatrix())
             .transpose();
+    // 距离方差近似由基础项、平面项、点测量项合成，再做正值保护。
     const double variance =
         std::max(1.0e-9,
                  0.001 +
@@ -269,6 +295,7 @@ MeasurementSummary FastLivoBridge::BuildLidarSummary(
     summary.information.noalias() += jacobian.transpose() * jacobian / variance;
     squared_error += plane.dis_to_plane_ * plane.dis_to_plane_;
 
+    // 保存局部点与世界平面，后端每次迭代重新算几何距离；不把前端残差直接冻结。
     LidarPlaneObservation observation;
     observation.point_l = plane.point_b_;
     observation.normal_w = plane.normal_;
@@ -278,6 +305,7 @@ MeasurementSummary FastLivoBridge::BuildLidarSummary(
     observations->push_back(observation);
   }
 
+  // 这里统计前端追踪像素数，可能不同于后端每个 patch 实际采样的 16 个像素。
   summary.residual_count = planes.size();
   summary.rmse = planes.empty()
                      ? std::numeric_limits<double>::infinity()
@@ -290,6 +318,7 @@ MeasurementSummary FastLivoBridge::BuildLidarSummary(
   return summary;
 }
 
+// 用前端追踪统计评估视觉质量，从当前原始图像另行导出可重投影的后端 patch。
 MeasurementSummary FastLivoBridge::BuildVisionSummary(
     const double timestamp, const VIOManagerPtr &vio_manager,
     VisualPatchObservationVector *observations) const
@@ -305,6 +334,7 @@ MeasurementSummary FastLivoBridge::BuildVisionSummary(
     return summary;
   }
 
+  // 质量摘要来自前端 H_T_H，并按灰度噪声尺度归一化；不是后端实际 patch Hessian。
   summary.information =
       vio_manager->H_T_H.topLeftCorner<kPoseDim, kPoseDim>() /
       std::max(1.0e-9, vio_manager->img_point_cov);
@@ -322,11 +352,13 @@ MeasurementSummary FastLivoBridge::BuildVisionSummary(
       std::min(1.0, static_cast<double>(vio_manager->total_points) /
                         std::max(1, vio_manager->length));
 
+  // 后续需要原始当前帧及相机；无效时不导出 patch。
   if (!vio_manager->new_frame_ || !vio_manager->cam) return summary;
   const cv::Mat &image = vio_manager->new_frame_->img_;
   observations->reserve(vio_manager->visual_submap->voxel_points.size());
   for (std::size_t i = 0; i < vio_manager->visual_submap->voxel_points.size(); ++i)
   {
+    // 只导出已具备有效法向的地图点，以支持后端参考切平面上的射线交点模型。
     const VisualPoint *point = vio_manager->visual_submap->voxel_points[i];
     if (!point || !point->is_normal_initialized_ || !point->normal_.allFinite() ||
         point->normal_.norm() < 1e-6) continue;
@@ -336,6 +368,7 @@ MeasurementSummary FastLivoBridge::BuildVisionSummary(
     if (!pixel.allFinite()) continue;
 
     VisualPatchObservation observation;
+    // 稳定 track ID 跨图像复用；世界点用于初始关联，中心射线与逆深度用于优化。
     observation.track_id = point->backend_track_id_;
     observation.point_w = point->pos_;
     observation.center_ray = point_c / point_c.z();
@@ -344,15 +377,18 @@ MeasurementSummary FastLivoBridge::BuildVisionSummary(
                             point->normal_).normalized();
     const double error = i < vio_manager->visual_submap->errors.size()
         ? std::max(0.0f, vio_manager->visual_submap->errors[i]) : 0.0;
+    // 将前端单点 patch 误差转成正的置信分数，后端入图时还会限幅。
     observation.tracking_score = std::exp(-std::sqrt(error /
         std::max(1, vio_manager->patch_size_total)) /
         std::max(1e-6, config_.vision_rmse_scale));
+    // 沿用前端逆曝光，不在后端新增曝光优化变量。
     observation.inverse_exposure = vio_manager->state
         ? vio_manager->state->inv_expo_time : 1.0;
     observation.photometric_sigma = std::sqrt(std::max(1e-6, vio_manager->img_point_cov));
 
     // A bounded 4 x 4 patch on pyramid level zero, sampled from the ORIGINAL
     // current image. The backend chooses references and rewarps at each solve.
+    // 在原 patch 范围采 4×4 个点，使用原始像素强度而非前端已 warp 的缓存。
     const int half = vio_manager->patch_size_half;
     bool valid = true;
     for (int row = 0; row < 4 && valid; ++row)
@@ -362,6 +398,7 @@ MeasurementSummary FastLivoBridge::BuildVisionSummary(
                                      -half + (2.0 * half - 1.0) * row / 3.0);
         const Eigen::Vector2d sample_pixel = pixel + offset;
         double value = 0.0;
+        // 相机反投影射线再除以 z，保证与逆 z 深度参数约定一致。
         Eigen::Vector3d ray = vio_manager->cam->cam2world(sample_pixel);
         if (!ray.allFinite() || ray.z() <= 1e-6 ||
             !BilinearIntensity(image, sample_pixel, &value)) { valid = false; break; }
@@ -373,6 +410,7 @@ MeasurementSummary FastLivoBridge::BuildVisionSummary(
   return summary;
 }
 
+// LIO 事件先传原始 IMU 包，再传本次滤波状态和点面观测；状态接纳由 Estimator 决定。
 bool FastLivoBridge::ProcessLidar(
     const double timestamp, const StatesGroup &state,
     const std::deque<sensor_msgs::Imu::ConstPtr> &imu_messages,
@@ -387,6 +425,7 @@ bool FastLivoBridge::ProcessLidar(
     if (message == nullptr) continue;
     ImuSample sample;
     sample.timestamp = message->header.stamp.toSec();
+    // 使用前端初始化得到的 acceleration_scale，只在桥接层换算一次加速度单位。
     sample.acceleration =
         acceleration_scale *
         Eigen::Vector3d(message->linear_acceleration.x,
@@ -405,10 +444,12 @@ bool FastLivoBridge::ProcessLidar(
       timestamp, state, planes, raw_feature_count, &observations);
   const bool result = backend_->ProcessLidar(
       ToNavState(timestamp, state), summary, observations);
+  // 即使本次未成为关键帧也发布已有结果/诊断，输出状态仍使用自己的实际时间。
   Publish(timestamp);
   return result;
 }
 
+// VIO 事件允许与同时间 LIO 共享节点；滤波位姿参考会由最新视觉更新替换。
 bool FastLivoBridge::ProcessVision(const double timestamp,
                                    const StatesGroup &state,
                                    const VIOManagerPtr &vio_manager,
@@ -424,6 +465,7 @@ bool FastLivoBridge::ProcessVision(const double timestamp,
     if (message == nullptr) continue;
     ImuSample sample;
     sample.timestamp = message->header.stamp.toSec();
+    // 使用前端初始化得到的 acceleration_scale，只在桥接层换算一次加速度单位。
     sample.acceleration =
         acceleration_scale *
         Eigen::Vector3d(message->linear_acceleration.x,
@@ -440,6 +482,7 @@ bool FastLivoBridge::ProcessVision(const double timestamp,
   VisualPatchObservationVector observations;
   const MeasurementSummary summary =
       BuildVisionSummary(timestamp, vio_manager, &observations);
+  // clone 后由采样回调按值持有；图像会随光度 cost 存活，直到其被淘汰/吸收后释放。
   const cv::Mat current_image =
       (vio_manager != nullptr && vio_manager->new_frame_ != nullptr)
           ? vio_manager->new_frame_->img_.clone()
@@ -457,16 +500,19 @@ bool FastLivoBridge::ProcessVision(const double timestamp,
         const double b = current_image.at<std::uint8_t>(y, x + 1);
         const double c = current_image.at<std::uint8_t>(y + 1, x);
         const double d = current_image.at<std::uint8_t>(y + 1, x + 1);
+        // 直接求同一双线性插值函数的分片导数，保证采样值与 Jacobian 的数值模型一致。
         *gradient = Eigen::Vector2d((1.0 - dy) * (b - a) + dy * (d - c),
                                     (1.0 - dx) * (c - a) + dx * (d - b));
         return true;
       };
   const bool result = backend_->ProcessVision(
       ToNavState(timestamp, state), summary, observations, image_sampler);
+  // 即使本次未成为关键帧也发布已有结果/诊断，输出状态仍使用自己的实际时间。
   Publish(timestamp);
   return result;
 }
 
+// 允许发布上次保留状态，不能把一次传感器回调返回 false 直接解释为无可用后端结果。
 void FastLivoBridge::Publish(const double timestamp) const
 {
   if (!enabled()) return;
@@ -474,6 +520,7 @@ void FastLivoBridge::Publish(const double timestamp) const
   if (backend_->LatestEstimate(&estimate))
   {
     nav_msgs::Odometry message;
+    // 里程计时间取 estimate.timestamp，不能用本次回调时间伪装成最新优化状态。
     message.header.stamp.fromSec(estimate.timestamp);
     message.header.frame_id = "camera_init";
     message.child_frame_id = "body";
@@ -484,6 +531,7 @@ void FastLivoBridge::Publish(const double timestamp) const
     message.pose.pose.orientation.x = estimate.q_w_i.x();
     message.pose.pose.orientation.y = estimate.q_w_i.y();
     message.pose.pose.orientation.z = estimate.q_w_i.z();
+    // ROS Odometry 的 twist 按 child_frame_id=body 表达，因此从世界系旋转回机体系。
     const Eigen::Vector3d velocity_body = estimate.q_w_i.conjugate() * estimate.v_w_i;
     message.twist.twist.linear.x = velocity_body.x();
     message.twist.twist.linear.y = velocity_body.y();
@@ -493,6 +541,8 @@ void FastLivoBridge::Publish(const double timestamp) const
 
   const BackendDiagnostics &diagnostics = backend_->diagnostics();
   std_msgs::Float64MultiArray diagnostic_message;
+  // 数组 0–16 沿用旧顺序，17 为位姿正则数，18–19 为最大修正，20 为拒绝次数。
+  // 未实现后端协方差估计；里程计默认 covariance 不能理解为零不确定性。
   diagnostic_message.data = {
       static_cast<double>(diagnostics.window_size),
       static_cast<double>(diagnostics.target_window_size),
@@ -517,6 +567,7 @@ void FastLivoBridge::Publish(const double timestamp) const
       static_cast<double>(diagnostics.rejected_pose_refinements)};
   diagnostics_publisher_.publish(diagnostic_message);
 
+  // TransformStamped(parent=imu, child=camera) 表示子系到父系，因此发布 T_IC=T_CI^-1。
   ExtrinsicState extrinsic = backend_->CameraExtrinsicEstimate();
   // TransformStamped(parent=IMU, child=camera) carries T_IC, not T_CI.
   extrinsic.q_c_i = extrinsic.q_c_i.conjugate();

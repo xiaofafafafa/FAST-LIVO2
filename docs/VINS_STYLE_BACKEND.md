@@ -1,5 +1,8 @@
 # VINS 风格后端代码导航
 
+完整的文件职责、坐标系与参数布局、因子生命周期、自适应公式和诊断字段见
+[adaptive_window 中文代码框架与阅读指南](ADAPTIVE_WINDOW_CODE_GUIDE_CN.md)。
+
 本次调整基于 Ceres 分支的 `df8ee2a3dfc59a4158a3adc4b19b9a1c17ae6c9e`。
 保留原来的四类传感器残差、时间关联、自适应策略和 Schur 算法；合并此前的
 `AdaptiveWindowBackend` / `FixedLagOptimizer` 为一个真正持有状态并完成求解的

@@ -12,6 +12,9 @@
 > The backend now follows VINS-style `Estimator` / `factor/` naming and includes
 > configurable regularization around FAST-LIVO2 filter poses. See
 > [`docs/VINS_STYLE_BACKEND.md`](docs/VINS_STYLE_BACKEND.md) for the code map.
+> 详细中文注释与框架说明见
+> [`docs/ADAPTIVE_WINDOW_CODE_GUIDE_CN.md`](docs/ADAPTIVE_WINDOW_CODE_GUIDE_CN.md)，
+> 包含文件职责、调用流程、状态布局、各类因子、边缘化和配置诊断。
 
 ## FAST-LIVO2: Fast, Direct LiDAR-Inertial-Visual Odometry
 

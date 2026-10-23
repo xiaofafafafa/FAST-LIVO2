@@ -4,6 +4,23 @@ Date: 2026-10-22. Refactor base: `df8ee2a3dfc59a4158a3adc4b19b9a1c17ae6c9e`.
 
 This is a source-level research implementation, not a validated SLAM release.
 
+## Chinese annotation and code guide update — 2026-10-23
+
+Documentation base: `db25302f507e6454cf163a75542abbbd04ced6e0`.
+Added 640 comment lines across all 28 C++ headers/sources in
+`include/adaptive_window` and `src/adaptive_window`, plus the
+[Chinese code guide](ADAPTIVE_WINDOW_CODE_GUIDE_CN.md) and navigation links.
+
+- PASS: the non-comment token sequence of each of the 28 C++ files is identical
+  to the base commit; no algorithm, API or default configuration was changed.
+- PASS: `git diff --check`.
+- PASS: all 53 relative links in the code guide, VINS navigation and integration
+  guide resolve; every one of the 28 C++ files is linked from the code guide.
+- C++ compilation, CTest and dataset replay were not run for this documentation
+  update. The execution and validation limitations below remain unchanged.
+
+## Implementation validation from 2026-10-22
+
 | Check | Status | Scope |
 |---|---|---|
 | `git diff --check` | PASS | Whitespace check only |

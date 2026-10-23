@@ -1,3 +1,8 @@
+/**
+ * @file adaptive_policy.cpp
+ * @brief 实现当前启发式自适应策略；质量分数与候选分数不等同于严格的条件信息增益。
+ * 中文框架说明：docs/ADAPTIVE_WINDOW_CODE_GUIDE_CN.md。
+ */
 #include "adaptive_window/adaptive_policy.h"
 
 #include "adaptive_window/math_utils.h"
@@ -11,6 +16,7 @@ namespace fast_livo
 namespace adaptive_window
 {
 
+// 初始目标夹在配置范围内；后续每个输入事件再逐步调整。
 AdaptivePolicy::AdaptivePolicy(const AdaptiveWindowConfig &config)
     : config_(config), target_window_size_(config.initial_window_size)
 {
@@ -19,6 +25,7 @@ AdaptivePolicy::AdaptivePolicy(const AdaptiveWindowConfig &config)
       std::min(config_.max_window_size, target_window_size_));
 }
 
+// 缺测/无效统计对应零质量，避免访问空指针或保留过期高分。
 double AdaptivePolicy::ModalityQuality(
     const MeasurementSummary *summary) const
 {
@@ -26,12 +33,14 @@ double AdaptivePolicy::ModalityQuality(
   return Clamp(summary->reliability, 0.0, 1.0);
 }
 
+// 用相对质量分配两个模态的目标权重，添加下限防止分母为零。
 ModalityWeights AdaptivePolicy::UpdateWeights(const double lidar_quality,
                                               const double vision_quality)
 {
   const double floor = std::max(1.0e-3, config_.min_modality_weight);
   const double lidar_raw = floor + lidar_quality;
   const double vision_raw = floor + vision_quality;
+  // 两个 raw 权重按均值归一化；质量相等时各自目标接近 1，未实现联合协方差估计。
   const double mean = 0.5 * (lidar_raw + vision_raw);
 
   ModalityWeights target;
@@ -39,10 +48,12 @@ ModalityWeights AdaptivePolicy::UpdateWeights(const double lidar_quality,
                        config_.max_modality_weight);
   target.vision = Clamp(vision_raw / mean, config_.min_modality_weight,
                         config_.max_modality_weight);
+  // 跨模态目标取两者几何均值；这里只是损失调度规则，非独立信息证明。
   target.cross_modal = Clamp(
       std::sqrt(std::max(0.0, target.lidar * target.vision)),
       config_.min_modality_weight, config_.max_modality_weight);
 
+  // 指数平滑减弱事件间跳变，alpha 表示保留旧权重的比例。
   const double alpha = Clamp(config_.weight_smoothing, 0.0, 0.999);
   weights_.lidar = alpha * weights_.lidar + (1.0 - alpha) * target.lidar;
   weights_.vision = alpha * weights_.vision + (1.0 - alpha) * target.vision;
@@ -51,6 +62,7 @@ ModalityWeights AdaptivePolicy::UpdateWeights(const double lidar_quality,
   return weights_;
 }
 
+// 可靠性不足时倾向利用更多历史，质量高时倾向缩短窗口；这是当前启发式设计。
 int AdaptivePolicy::UpdateWindowTarget(const double combined_quality,
                                        const double last_solve_time_ms)
 {
@@ -68,11 +80,13 @@ int AdaptivePolicy::UpdateWindowTarget(const double combined_quality,
 
   desired = std::max(config_.min_window_size,
                      std::min(config_.max_window_size, desired));
+  // 无论目标距离多远，每次决策只走一帧，避免窗口目标振荡。
   if (desired > target_window_size_) ++target_window_size_;
   else if (desired < target_window_size_) --target_window_size_;
   return target_window_size_;
 }
 
+// 同时输出权重、目标窗口和关键帧选择；尚未进行真实后验条件信息增益计算。
 PolicyDecision AdaptivePolicy::Decide(
     const NavState &candidate, const MeasurementSummary *lidar,
     const MeasurementSummary *vision, const PolicyFrameVector &window,
@@ -90,6 +104,7 @@ PolicyDecision AdaptivePolicy::Decide(
   decision.target_window_size =
       UpdateWindowTarget(combined_quality, last_solve_time_ms);
 
+  // 首帧直接尝试接纳；之后仍需由 Estimator 检查输入有效性。
   if (window.empty())
   {
     decision.select_keyframe = true;
@@ -97,6 +112,7 @@ PolicyDecision AdaptivePolicy::Decide(
     return decision;
   }
 
+  // 与最新保留状态比较运动，而不是与每个传感器输入比较。
   const NavState &last = window.back().state;
   const double dt = std::max(0.0, candidate.timestamp - last.timestamp);
   const double translation = (candidate.p_w_i - last.p_w_i).norm();
@@ -112,6 +128,7 @@ PolicyDecision AdaptivePolicy::Decide(
   const double time_score = Clamp(
       dt / std::max(config_.min_keyframe_dt, config_.max_keyframe_dt), 0.0,
       1.0);
+  // 互补项只反映两个近期模态摘要是否存在，不直接度量互补几何方向。
   const double complement_score =
       (lidar != nullptr && vision != nullptr) ? 1.0 : 0.0;
 
@@ -120,6 +137,7 @@ PolicyDecision AdaptivePolicy::Decide(
       0.25 * combined_quality + 0.25 * time_score +
       0.20 * complement_score;
 
+  // 达到最大时间间隔可触发接纳；否则同时满足最小间隔与效用阈值。
   decision.select_keyframe =
       dt >= config_.max_keyframe_dt ||
       (dt >= config_.min_keyframe_dt &&
@@ -127,6 +145,7 @@ PolicyDecision AdaptivePolicy::Decide(
   return decision;
 }
 
+// 评分越高越倾向删除；保护最新帧，对跨模态参考仅加惩罚以保持窗口可缩减。
 std::uint64_t AdaptivePolicy::SelectMarginalizationCandidate(
     const PolicyFrameVector &window, const int target_window_size) const
 {
@@ -157,11 +176,14 @@ std::uint64_t AdaptivePolicy::SelectMarginalizationCandidate(
       const double detour =
           (frame.state.p_w_i - window[i - 1].state.p_w_i).norm() +
           (window[i + 1].state.p_w_i - frame.state.p_w_i).norm();
+      // 当前变量按 1-baseline/detour 计算，反映局部路径形状的启发式分数。
+      // 该比值在绕行增大时上升，不能解释成已经严格验证的观测冗余或信息损失。
       redundancy = Clamp(1.0 - baseline / std::max(1.0e-6, detour), 0.0, 1.0);
     }
 
     const double unique_penalty = Clamp(frame.unique_information, 0.0, 1.0);
     const double anchor_penalty = frame.has_cross_modal ? 0.20 : 0.0;
+    // 老化/路径项提高删除倾向，质量/跨模态标记降低删除倾向；系数沿用当前实现。
     const double score = 0.55 * age_score + 0.35 * redundancy -
                          0.30 * unique_penalty - anchor_penalty;
     if (score > best_score)

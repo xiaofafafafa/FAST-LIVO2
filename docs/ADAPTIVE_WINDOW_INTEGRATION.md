@@ -7,6 +7,8 @@
 随后在 Ceres 版本 `df8ee2a3dfc59a4158a3adc4b19b9a1c17ae6c9e` 上按 VINS-Mono 命名组织为
 `Estimator` + `factor/`，并加入 FAST-LIVO2 位姿正则项。代码阅读顺序见
 [VINS 风格代码导航](VINS_STYLE_BACKEND.md)。
+逐文件中文说明、状态与内存关系及完整调用流程见
+[adaptive_window 中文代码框架与阅读指南](ADAPTIVE_WINDOW_CODE_GUIDE_CN.md)。
 
 **当前是未完成编译和数据集验证的研究实现。** 开发环境没有 ROS、Eigen、Ceres 或
 CMake，依赖安装受限；下文的 C++ 测试已编写，但未在该环境执行。不能据此声称精度提高、
