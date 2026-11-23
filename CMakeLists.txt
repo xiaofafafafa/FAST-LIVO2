@@ -11,7 +11,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Eigen3 3.3 REQUIRED NO_MODULE)
-find_package(Ceres 1.14 REQUIRED)
+# Ceres 2.x packages can advertise SameMajorVersion compatibility, causing
+# find_package(Ceres 1.14) to reject a supported, newer Ceres installation.
+find_package(Ceres REQUIRED)
+if(DEFINED CERES_VERSION AND CERES_VERSION VERSION_LESS "1.14")
+  message(FATAL_ERROR "Ceres 1.14 or newer is required (found ${CERES_VERSION})")
+endif()
 option(ADAPTIVE_WINDOW_STANDALONE "Build Ceres backend and tests without ROS/PCL/OpenCV" OFF)
 if(ADAPTIVE_WINDOW_STANDALONE)
   include(cmake/AdaptiveWindow.cmake)
