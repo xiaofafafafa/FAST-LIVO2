@@ -8,11 +8,16 @@ permissions:
 jobs:
   cpu:
     runs-on: ubuntu-22.04
+    container: ubuntu:22.04
     timeout-minutes: 30
     steps:
+      - name: Install CPU dependencies in a clean Jammy environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates git build-essential cmake libceres-dev libeigen3-dev python3-scipy python3-numpy python3-pil
       - uses: actions/checkout@v4
-      - name: Install CPU dependencies
-        run: sudo apt-get update && sudo apt-get install -y libceres-dev libeigen3-dev python3-scipy python3-numpy python3-pil
       - name: CPU mapping and standalone Ceres tests
         env:
           PYTHON_BIN: /usr/bin/python3
