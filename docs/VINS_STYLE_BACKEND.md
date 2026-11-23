@@ -1,8 +1,5 @@
 # VINS 风格后端代码导航
 
-完整的文件职责、坐标系与参数布局、因子生命周期、自适应公式和诊断字段见
-[adaptive_window 中文代码框架与阅读指南](ADAPTIVE_WINDOW_CODE_GUIDE_CN.md)。
-
 本次调整基于 Ceres 分支的 `df8ee2a3dfc59a4158a3adc4b19b9a1c17ae6c9e`。
 保留原来的四类传感器残差、时间关联、自适应策略和 Schur 算法；合并此前的
 `AdaptiveWindowBackend` / `FixedLagOptimizer` 为一个真正持有状态并完成求解的
@@ -66,7 +63,7 @@
   Schur 先验中，不重新拼接并重复添加同一批惯性信息。
 - `para_Ex_Pose[0]` 表示 **IMU 到相机的 T_CI**，沿用 FAST-LIVO2 方向，
   与 VINS 常用的相机到 IMU 外参方向相反；不要直接互换标定数组。
-- `PoseLocalParameterization` 使用 **Ceres 2.1 Manifold**，保留真实的 7×6
+- `PoseLocalParameterization` 在 Ceres 2.1+ 使用 Manifold、在 1.x/2.0 使用 LocalParameterization，保留真实的 7×6
   Plus Jacobian。不能替换成旧 VINS 的占位 Jacobian 写法。
 - 前端已经初始化。本后端不重复执行 VINS 的视觉 SFM / 重力初始化，也不在
   `double2vector()` 中做 VINS 式全局 yaw/位置重新对齐；世界坐标由前端位姿正则保持。
@@ -83,7 +80,8 @@
 
 [测试源码](../test/adaptive_window_smoke.cpp) 包含解析解、参考替换、Jacobian、
 拒绝回滚、四类原有残差以及边缘化检查。
-**C++ 编译、测试执行和数据集回放尚未完成。**
+NTU VIRAL `eee_01` 的 C++ 编译、合成测试和完整数据集回放已完成，
+精度对比见 [NTU 评估记录](NTU_ADAPTIVE_EVALUATION.md)。
 构建命令、公式与全部诊断字段见
 [集成指南](ADAPTIVE_WINDOW_INTEGRATION.md)，已完成检查见
 [验证记录](CERES_BACKEND_VALIDATION.md)。

@@ -243,10 +243,133 @@ void VIOManager::insertPointIntoVoxelMap(VisualPoint *pt_new)
   }
   else
   {
-    VOXEL_POINTS *ot = new VOXEL_POINTS(0);
+    VOXEL_POINTS *ot = new VOXEL_POINTS(1);
     ot->voxel_points.push_back(pt_new);
     feat_map[position] = ot;
   }
+}
+
+std::size_t VIOManager::ApplyFeedbackCorrections(
+    const std::vector<fast_livo::adaptive_window::PoseCorrection> &corrections,
+    double max_extrapolation)
+{
+  if (corrections.empty()) return 0;
+  std::size_t changed_points = 0;
+  std::vector<VisualPoint *> relocated;
+  std::vector<VOXEL_LOCATION> empty_keys;
+  const auto voxel_key = [](const V3D &position) {
+    float loc[3];
+    for (int j = 0; j < 3; ++j)
+    {
+      loc[j] = position[j] / 0.5;
+      if (loc[j] < 0) loc[j] -= 1.0;
+    }
+    return VOXEL_LOCATION(static_cast<int64_t>(loc[0]),
+                          static_cast<int64_t>(loc[1]),
+                          static_cast<int64_t>(loc[2]));
+  };
+  for (auto &entry : feat_map)
+  {
+    auto &points = entry.second->voxel_points;
+    for (std::size_t index = 0; index < points.size(); )
+    {
+      VisualPoint *point = points[index];
+      fast_livo::adaptive_window::PoseCorrection correction;
+      bool moved = false;
+      if (!frozen_anchor_times_.count(point->world_anchor_time_) &&
+          fast_livo::adaptive_window::CorrectionAt(
+              corrections, point->world_anchor_time_, max_extrapolation,
+              &correction) &&
+          fast_livo::adaptive_window::HasMaterialCorrection(
+              correction, 1.0e-8, 1.0e-8))
+      {
+        const M3D rotation = correction.rotation.toRotationMatrix();
+        point->pos_ = rotation * point->pos_ + correction.translation;
+        point->normal_ = rotation * point->normal_;
+        point->previous_normal_ = rotation * point->previous_normal_;
+        point->covariance_ = rotation * point->covariance_ * rotation.transpose();
+        ++changed_points;
+        moved = !(voxel_key(point->pos_) == entry.first);
+      }
+      for (Feature *feature : point->obs_)
+      {
+        if (!frozen_anchor_times_.count(feature->source_image_time_) &&
+            fast_livo::adaptive_window::CorrectionAt(
+                corrections, feature->source_image_time_, max_extrapolation,
+                &correction) &&
+            fast_livo::adaptive_window::HasMaterialCorrection(
+                correction, 1.0e-8, 1.0e-8))
+        {
+          const SE3 delta(correction.rotation.toRotationMatrix(),
+                          correction.translation);
+          feature->T_f_w_ = feature->T_f_w_ * delta.inverse();
+        }
+      }
+      if (moved)
+      {
+        relocated.push_back(point);
+        points[index] = points.back();
+        points.pop_back();
+      }
+      else ++index;
+    }
+    entry.second->count = static_cast<int>(points.size());
+    if (points.empty()) empty_keys.push_back(entry.first);
+  }
+  for (const auto &key : empty_keys)
+  {
+    auto it = feat_map.find(key);
+    delete it->second;  // empty container; relocated points retain ownership below
+    feat_map.erase(it);
+  }
+  for (VisualPoint *point : relocated) insertPointIntoVoxelMap(point);
+
+  if (new_frame_)
+  {
+    fast_livo::adaptive_window::PoseCorrection correction;
+    if (fast_livo::adaptive_window::CorrectionAt(
+            corrections, current_image_timestamp_, max_extrapolation,
+            &correction))
+    {
+      const SE3 delta(correction.rotation.toRotationMatrix(),
+                      correction.translation);
+      new_frame_->T_f_w_ = new_frame_->T_f_w_ * delta.inverse();
+    }
+  }
+  return changed_points;
+}
+
+void VIOManager::FreezeRetiredAnchors(
+    const std::vector<fast_livo::adaptive_window::RetiredFrame> &retired)
+{
+  for (const auto &frame : retired)
+    frozen_anchor_times_.insert(frame.optimized.timestamp);
+}
+
+void VIOManager::ApplyOptimizedCameraExtrinsic(
+    const M3D &rotation_c_i, const V3D &translation_c_i)
+{
+  if (!rotation_c_i.allFinite() || !translation_c_i.allFinite()) return;
+  const SE3 previous(Rci, Pci);
+  const SE3 updated(rotation_c_i, translation_c_i);
+  const SE3 change = updated * previous.inverse();
+  if ((translation_c_i - Pci).norm() < 1.0e-6 &&
+      Eigen::AngleAxisd(Rci.transpose() * rotation_c_i).angle() < 1.0e-6)
+    return;
+  Rci = rotation_c_i;
+  Pci = translation_c_i;
+  Rcl = Rci * Rli.transpose();
+  Pcl = Pci - Rcl * Pli;
+  Jdphi_dR = Rci;
+  const V3D p_i_c = -Rci.transpose() * Pci;
+  M3D skew;
+  skew << SKEW_SYM_MATRX(p_i_c);
+  Jdp_dR = -Rci * skew;
+  for (auto &entry : feat_map)
+    for (VisualPoint *point : entry.second->voxel_points)
+      for (Feature *feature : point->obs_)
+        feature->T_f_w_ = change * feature->T_f_w_;
+  if (new_frame_) new_frame_->T_f_w_ = change * new_frame_->T_f_w_;
 }
 
 void VIOManager::getWarpMatrixAffineHomography(const vk::AbstractCamera &cam, const V2D &px_ref, const V3D &xyz_ref, const V3D &normal_ref,
@@ -801,7 +924,7 @@ void VIOManager::computeJacobianAndUpdateEKF(cv::Mat img)
   updateFrameState(*state);
 }
 
-void VIOManager::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg)
+void VIOManager::generateVisualMapPoints(cv::Mat img, const vector<pointWithVar> &pg)
 {
   if (pg.size() <= 10) return;
 
@@ -875,6 +998,9 @@ void VIOManager::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg)
       getImagePatch(img, pc, patch, 0);
 
       VisualPoint *pt_new = new VisualPoint(pt);
+      pt_new->world_anchor_time_ = pt_var.source_lidar_time >= 0.0
+                                      ? pt_var.source_lidar_time
+                                      : current_image_timestamp_;
 
       if (pt_var.source_lidar_time >= 0.0)
       {
@@ -885,6 +1011,7 @@ void VIOManager::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg)
 
       Vector3d f = cam->cam2world(pc);
       Feature *ftr_new = new Feature(pt_new, patch, pc, f, new_frame_->T_f_w_, 0);
+      ftr_new->source_image_time_ = current_image_timestamp_;
       ftr_new->img_ = img;
       ftr_new->id_ = new_frame_->id_;
       ftr_new->inv_expo_time_ = state->inv_expo_time;
@@ -964,11 +1091,13 @@ void VIOManager::updateVisualMapPoints(cv::Mat img)
       update_flag[i] = 1;
       Vector3d f = cam->cam2world(pc);
       Feature *ftr_new = new Feature(pt, patch_temp, pc, f, new_frame_->T_f_w_, visual_submap->search_levels[i]);
+      ftr_new->source_image_time_ = current_image_timestamp_;
       ftr_new->img_ = img;
       ftr_new->id_ = new_frame_->id_;
       ftr_new->inv_expo_time_ = state->inv_expo_time;
       pt->addFrameRef(ftr_new);
     }
+    else delete[] patch_temp;
   }
   printf("[ VIO ] Update %d points in visual submap\n", update_num);
 }
@@ -1790,7 +1919,21 @@ void VIOManager::dumpDataForColmap()
   cnt++;
 }
 
-void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map, double img_time)
+bool VIOManager::CommitKeyframeMap(
+    const vector<pointWithVar> &pg,
+    const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map)
+{
+  if (!new_frame_ || new_frame_->id_ == last_committed_frame_id_) return false;
+  // A selected image adds landmarks and reference patches once, after its
+  // optimized pose has been fed back to the frontend state and frame.
+  generateVisualMapPoints(new_frame_->img_, pg);
+  updateVisualMapPoints(new_frame_->img_);
+  updateReferencePatch(plane_map);
+  last_committed_frame_id_ = new_frame_->id_;
+  return true;
+}
+
+void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map, double img_time, bool update_map)
 {
   if (width != img.cols || height != img.rows)
   {
@@ -1818,7 +1961,7 @@ void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unor
 
   double t3 = omp_get_wtime();
 
-  generateVisualMapPoints(img, pg);
+  if (update_map) generateVisualMapPoints(img, pg);
 
   double t4 = omp_get_wtime();
   
@@ -1828,11 +1971,11 @@ void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unor
 
   double t5 = omp_get_wtime();
 
-  updateVisualMapPoints(img);
+  if (update_map) updateVisualMapPoints(img);
 
   double t6 = omp_get_wtime();
 
-  updateReferencePatch(feat_map);
+  if (update_map) updateReferencePatch(feat_map);
 
   double t7 = omp_get_wtime();
   

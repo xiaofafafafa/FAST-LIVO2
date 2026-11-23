@@ -40,6 +40,7 @@ public:
   bool has_lidar_anchor_;       //!< True when this point originated from a LiDAR scan.
   double source_lidar_time_;    //!< Timestamp of the source LiDAR/LIO frame.
   Vector3d source_lidar_point_; //!< Source point expressed in the LiDAR frame.
+  double world_anchor_time_ = -1.0; //!< Native time used to correct this map point.
 
   VisualPoint(const Vector3d &pos);
   ~VisualPoint();

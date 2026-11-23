@@ -1,0 +1,33 @@
+<launch>
+  <arg name="rviz" default="true" />
+  <arg name="rviz_config" default="$(find fast_livo)/rviz_cfg/ntu_viral_adaptive.rviz" />
+  <arg name="use_sim_time" default="false" />
+  <arg name="feedback_enabled" default="true" />
+  <arg name="frontend_seq_name" default="eee_01_adaptive_frontend" />
+  <arg name="backend_result_path" default="$(find fast_livo)/Log/result/eee_01_adaptive_backend.txt" />
+  <arg name="diagnostic_csv_path" default="" />
+  <arg name="max_keyframe_dt" default="0.55" />
+
+  <!-- Wall time matches the original NTU launch and works with ordinary bag playback. -->
+  <!-- For simulated time, set use_sim_time:=true and publish the bag clock. -->
+  <param name="/use_sim_time" value="$(arg use_sim_time)" type="bool" />
+  <rosparam command="load" file="$(find fast_livo)/config/NTU_VIRAL.yaml" />
+  <rosparam command="load" file="$(find fast_livo)/config/adaptive_window.yaml" />
+  <rosparam command="load" file="$(find fast_livo)/config/adaptive_window_ntu.yaml" />
+  <param name="adaptive_window/feedback_enabled" value="$(arg feedback_enabled)" type="bool" />
+  <param name="evo/seq_name" value="$(arg frontend_seq_name)" />
+  <param name="adaptive_window/pose_output_path" value="$(arg backend_result_path)" />
+  <param name="adaptive_window/diagnostic_csv_path" value="$(arg diagnostic_csv_path)" />
+  <param name="adaptive_window/max_keyframe_dt" value="$(arg max_keyframe_dt)" type="double" />
+
+  <node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen">
+    <rosparam file="$(find fast_livo)/config/camera_NTU_VIRAL.yaml" />
+  </node>
+
+  <group if="$(arg rviz)">
+    <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz"
+          args="-d $(arg rviz_config)">
+      <env name="DISABLE_ROS1_EOL_WARNINGS" value="1" />
+    </node>
+  </group>
+</launch>

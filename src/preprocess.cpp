@@ -85,11 +85,55 @@ void Preprocess::process(const sensor_msgs::PointCloud2::ConstPtr &msg, PointClo
     robosense_handler(msg);
     break;
 
+  case LIVOX_POINTCLOUD2:
+    livox_pointcloud2_handler(msg);
+    break;
+
   default:
     printf("Error LiDAR Type: %d \n", lidar_type);
     break;
   }
   *pcl_out = pl_surf;
+}
+
+void Preprocess::livox_pointcloud2_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
+{
+  pl_surf.clear();
+  pl_corn.clear();
+  pl_full.clear();
+
+  pcl::PointCloud<livox_pointcloud2_ros::Point> points;
+  pcl::fromROSMsg(*msg, points);
+  if (points.empty()) return;
+
+  const double scan_start_ns = msg->header.stamp.toNSec();
+  const int filter_num = std::max(1, point_filter_num);
+  pl_surf.reserve(points.size() / filter_num + 1);
+  for (std::size_t i = 0; i < points.size(); ++i)
+  {
+    if (i % filter_num != 0) continue;
+    const auto &point = points.points[i];
+    if (point.line >= N_SCANS || !std::isfinite(point.x) || !std::isfinite(point.y) ||
+        !std::isfinite(point.z) || !std::isfinite(point.timestamp)) continue;
+
+    const double range_sq = point.x * point.x + point.y * point.y + point.z * point.z;
+    const double offset_ms = (point.timestamp - scan_start_ns) / 1e6;
+    if (range_sq < blind_sqr || offset_ms < 0.0 || offset_ms > 1000.0) continue;
+
+    PointType sample;
+    sample.x = point.x;
+    sample.y = point.y;
+    sample.z = point.z;
+    sample.intensity = point.intensity;
+    sample.normal_x = 0.0f;
+    sample.normal_y = 0.0f;
+    sample.normal_z = 0.0f;
+    sample.curvature = static_cast<float>(offset_ms);
+    pl_surf.push_back(sample);
+  }
+
+  std::sort(pl_surf.points.begin(), pl_surf.points.end(),
+            [](const PointType &a, const PointType &b) { return a.curvature < b.curvature; });
 }
 
 void Preprocess::avia_handler(const livox_ros_driver::CustomMsg::ConstPtr &msg)

@@ -1,16 +1,27 @@
 # Information-driven adaptive fixed-lag backend for FAST-LIVO2.
-# Start with feedback_enabled=false and validate the parallel odometry topic.
+# Optimized states feed the frontend filter and the active LiDAR/visual maps.
 adaptive_window:
   enabled: true
-  feedback_enabled: false  # shadow mode enforced; covariance transfer is not implemented
+  feedback_enabled: true
+  feedback_max_active_scans: 20  # warning limit; only marginalized scans enter the frozen map
+  feedback_map_min_translation: 0.01  # rebuild active map above 1 cm accumulated correction
+  feedback_map_min_rotation_deg: 0.1
+  feedback_covariance_inflation: 1.05  # scale added correction uncertainty, not the whole EKF covariance
+  pose_output_en: true  # write accepted optimized states as a TUM trajectory
   optimize_extrinsics: false  # opt in only after excitation/observability tests
 
   min_window_size: 4
   max_window_size: 12
   initial_window_size: 6
   max_lidar_factors: 160
+  lidar_effective_factors: 160  # dataset-specific overrides may reduce this
+  lidar_outlier_sigma: 3.0  # gate against the final frontend pose
   max_cross_modal_factors: 80  # admitted patch observations per image
   max_active_patches: 160
+  cross_modal_temporal_max_dt: 0.0  # 0 disables optional second-plane tie to another pose
+  cross_modal_temporal_time_sigma: 0.15
+  cross_modal_temporal_confidence: 0.25  # discount correlated scans/map planes
+  preserve_visual_anchors: false  # prefer retaining frames that anchor active photometric tracks
   plane_search_radius: 0.75
   plane_max_rms: 0.05
   cross_modal_plane_sigma: 0.05
@@ -24,11 +35,11 @@ adaptive_window:
   association_time_sigma: 0.025
   allow_pair_reuse: true
 
-  min_keyframe_dt: 0.05
-  max_keyframe_dt: 0.50
-  keyframe_translation: 0.20
-  keyframe_rotation_deg: 8.0
-  keyframe_utility_threshold: 0.55
+  min_keyframe_dt: 0.15
+  max_keyframe_dt: 0.55
+  keyframe_translation: 0.25
+  keyframe_rotation_deg: 10.0
+  keyframe_utility_threshold: 0.60
 
   min_modality_weight: 0.15
   max_modality_weight: 2.50
@@ -36,6 +47,9 @@ adaptive_window:
   information_smoothing: 0.90
   information_logdet_floor: -35.0
   information_logdet_ceiling: 30.0
+  normalized_information_policy: false  # optional spectral policy; eee_01 full replay did not improve APE
+  information_translation_scale: 0.05  # reference perturbation, m
+  information_rotation_scale_deg: 1.0  # reference perturbation, degrees
   degeneracy_eigen_threshold: 0.0001
   lidar_rmse_scale: 0.08
   vision_rmse_scale: 20.0
@@ -52,6 +66,7 @@ adaptive_window:
   frontend_pose_translation_sigma: 0.05
   frontend_pose_rotation_deg: 1.0
   frontend_pose_prior_weight: 1.0
+  weak_direction_prior_gain: 0.0  # bounded extra regularization in poorly observed pose directions
   frontend_pose_max_translation: 0.20
   frontend_pose_max_rotation_deg: 5.0
 
@@ -63,7 +78,7 @@ adaptive_window:
   extrinsic_translation_sigma: 0.05
   extrinsic_rotation_deg: 3.0
 
-  # VINS-style discrete noise stddevs (not continuous-time noise densities).
+  # Discrete sample standard deviations (not continuous-time noise densities).
   imu_max_gap: 0.05
   imu_repropagate_acc_bias: 0.05
   imu_repropagate_gyr_bias: 0.005

@@ -1,0 +1,8 @@
+# NTU-VIRAL overrides. The frontend's imu/*_cov parameters are variances;
+# the fixed-lag preintegrator expects discrete sample standard deviations.
+adaptive_window:
+  imu_acc_noise: 0.7071067811865476  # sqrt(imu/acc_cov = 0.5)
+  imu_gyr_noise: 0.5477225575051661  # sqrt(imu/gyr_cov = 0.3)
+  imu_acc_bias_rw: 0.01       # sqrt(imu/b_acc_cov = 0.0001)
+  imu_gyr_bias_rw: 0.01       # sqrt(imu/b_gyr_cov = 0.0001)
+  lidar_effective_factors: 128  # eee_01 replay: 128 improves APE over 16; retain a small correlation discount

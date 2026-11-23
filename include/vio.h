@@ -14,6 +14,7 @@ which is included as part of this source code package.
 #define VIO_H_
 
 #include "voxel_map.h"
+#include "adaptive_window/feedback_correction.h"
 #include "feature.h"
 #include <opencv2/imgproc/imgproc_c.h>
 #include <pcl/filters/voxel_grid.h>
@@ -142,9 +143,19 @@ public:
   ~VIOManager();
   void updateStateInverse(cv::Mat img, int level);
   void updateState(cv::Mat img, int level);
-  void processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map, double img_time);
+  void processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map, double img_time, bool update_map = true);
+  bool CommitKeyframeMap(const vector<pointWithVar> &pg,
+                         const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map);
+  void FreezeRetiredAnchors(
+      const std::vector<fast_livo::adaptive_window::RetiredFrame> &retired);
+  void setCurrentImageTimestamp(double timestamp) { current_image_timestamp_ = timestamp; }
+  std::size_t ApplyFeedbackCorrections(
+      const std::vector<fast_livo::adaptive_window::PoseCorrection> &corrections,
+      double max_extrapolation);
+  void ApplyOptimizedCameraExtrinsic(const M3D &rotation_c_i,
+                                     const V3D &translation_c_i);
   void retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map);
-  void generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg);
+  void generateVisualMapPoints(cv::Mat img, const vector<pointWithVar> &pg);
   void setImuToLidarExtrinsic(const V3D &transl, const M3D &rot);
   void setLidarToCameraExtrinsic(vector<double> &R, vector<double> &P);
   void initializeVIO();
@@ -181,6 +192,10 @@ public:
 
   // PointCloudXYZI::Ptr pg_down;
   // pcl::VoxelGrid<PointType> downSizeFilter;
+private:
+  double current_image_timestamp_ = -1.0;
+  int last_committed_frame_id_ = -1;
+  std::unordered_set<double> frozen_anchor_times_;
 };
 typedef std::shared_ptr<VIOManager> VIOManagerPtr;
 

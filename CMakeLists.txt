@@ -11,7 +11,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Eigen3 3.3 REQUIRED NO_MODULE)
-find_package(Ceres 2.1 REQUIRED)
+find_package(Ceres 1.14 REQUIRED)
 option(ADAPTIVE_WINDOW_STANDALONE "Build Ceres backend and tests without ROS/PCL/OpenCV" OFF)
 if(ADAPTIVE_WINDOW_STANDALONE)
   include(cmake/AdaptiveWindow.cmake)
@@ -111,8 +111,6 @@ find_package(PCL REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(Sophus REQUIRED)
 find_package(Boost REQUIRED COMPONENTS thread)
-
-set(Sophus_LIBRARIES libSophus.so)
 
 # Define the catkin package
 catkin_package(

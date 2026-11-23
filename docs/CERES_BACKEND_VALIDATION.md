@@ -1,25 +1,12 @@
 # Validation status — VINS-style Ceres backend
 
-Date: 2026-10-22. Refactor base: `df8ee2a3dfc59a4158a3adc4b19b9a1c17ae6c9e`.
+Updated: 2026-11-13. Refactor base: `df8ee2a3dfc59a4158a3adc4b19b9a1c17ae6c9e`.
+
+This table records the 2026-11-13 environment. A later full NTU VIRAL
+`eee_01` ROS replay and accuracy comparison completed on 2026-11-16; see
+[NTU adaptive evaluation](NTU_ADAPTIVE_EVALUATION.md).
 
 This is a source-level research implementation, not a validated SLAM release.
-
-## Chinese annotation and code guide update — 2026-10-23
-
-Documentation base: `db25302f507e6454cf163a75542abbbd04ced6e0`.
-Added 640 comment lines across all 28 C++ headers/sources in
-`include/adaptive_window` and `src/adaptive_window`, plus the
-[Chinese code guide](ADAPTIVE_WINDOW_CODE_GUIDE_CN.md) and navigation links.
-
-- PASS: the non-comment token sequence of each of the 28 C++ files is identical
-  to the base commit; no algorithm, API or default configuration was changed.
-- PASS: `git diff --check`.
-- PASS: all 53 relative links in the code guide, VINS navigation and integration
-  guide resolve; every one of the 28 C++ files is linked from the code guide.
-- C++ compilation, CTest and dataset replay were not run for this documentation
-  update. The execution and validation limitations below remain unchanged.
-
-## Implementation validation from 2026-10-22
 
 | Check | Status | Scope |
 |---|---|---|
@@ -28,13 +15,16 @@ Added 640 comment lines across all 28 C++ headers/sources in
 | Obsolete optimizer/factory/preintegrator symbols and delimiter scan | PASS | Textual source checks only |
 | Independent frontend-pose rotation residual check | PASS | NumPy right-increment log Jacobian comparison; maximum error 4.14e-10 |
 | Independent scalar regularization / reference replacement | PASS | Expected solutions 0.020 m and 0.044 m for the synthetic conflicting measurement |
-| C++ compilation and linking | NOT RUN | CMake, Eigen, Ceres and ROS unavailable in the editing environment |
-| `adaptive_window_smoke` executable | NOT RUN | Test source is supplied; no passing C++ test result is claimed |
-| ROS launch / rosbag / dataset replay | NOT RUN | Requires the user's configured ROS and sensor/data environment |
+| C++ compilation and linking | PASS | ROS Noetic, GCC 9.4, Eigen 3.3.7, Ceres 1.14; isolated catkin build produced `fastlivo_mapping` |
+| `adaptive_window_smoke` executable | PASS | Standalone executable and catkin CTest passed |
+| Address/undefined-behavior sanitizers | PASS (without leak check) | Standalone smoke test passed with ASan and UBSan; LeakSanitizer cannot inspect processes in this sandbox |
+| Livox PointCloud2 preprocessing | PASS | Actual C++ `Preprocess` processed the first 300 scans of a local bag: 4,613,740 finite, time-ordered points; the same bag's first 30 seconds had 6,000 finite IMU messages with at most 7.3 ms gaps |
+| ROS launch configuration | PASS | `roslaunch --dump-params` and `roslaunch --nodes` resolved the PointCloud2 adaptive launch |
+| ROS launch / rosbag / dataset replay | BLOCKED | `roscore` fails with `Unable to start XML-RPC server: Operation not permitted` in this execution environment |
 | Runtime, memory, ATE/RPE, extrinsic convergence | NOT MEASURED | No performance or accuracy claims |
 
-The independent numerical checks verify the equations only. They do not compile
-or execute the C++ factor, Ceres solver, pointer-lifetime handling or ROS bridge.
+The passing synthetic test executes the C++ factors and Ceres solver. The ROS
+bridge compiled and linked, but its live callback behavior remains unverified.
 The 5 cm / 1 degree regularization scales and 20 cm / 5 degree acceptance gates
 are starting configurations, not data-calibrated recommendations.
 
@@ -44,7 +34,7 @@ systems). This refactor moves that computation into
 `factor/marginalization_factor.cpp`; the old numerical check is not a new C++
 regression-test result.
 
-## Added C++ checks, awaiting execution
+## C++ checks executed
 
 - Frontend-pose tangent Jacobian and quaternion sign invariance.
 - Exactly one frontend pose factor per retained state, including same-time
@@ -60,17 +50,13 @@ regression-test result.
 
 ## Required next checks
 
-1. Build and run the standalone CTest target described in
-   [the integration guide](ADAPTIVE_WINDOW_INTEGRATION.md).
-2. Build the full catkin package against Ceres >= 2.1 and the original FAST-LIVO2
-   dependencies. Record exact compiler, ROS, Eigen and Ceres versions.
-3. Replay a short static/slow-motion recording. Check IMU rejection/reset counts,
+1. Replay a short static/slow-motion recording outside the sandbox. Check IMU rejection/reset counts,
    factor counts, timestamps, transform directions, frontend correction magnitudes
    and correction rejection counts before evaluating trajectory accuracy.
-4. Keep state feedback disabled. Compare the shadow output with the frontend;
+2. Keep state feedback disabled. Compare the shadow output with the frontend;
    ablate the frontend-pose regularizer using the same data and configuration.
    Enable extrinsic optimization only on sufficiently excited data.
-5. Add high-rotation-rate and recorded-IMU tests. The supplied synthetic checks
+3. Add high-rotation-rate and recorded-IMU tests. The supplied synthetic checks
    are intentionally not a benchmark.
 
 The frontend pose factor reuses information from the same sensor data and is

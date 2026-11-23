@@ -11,6 +11,8 @@ which is included as part of this source code package.
 */
 
 #include "voxel_map.h"
+#include <algorithm>
+#include <limits>
 
 void calcBodyCov(Eigen::Vector3d &pb, const float range_inc, const float degree_inc, Eigen::Matrix3d &cov)
 {
@@ -529,7 +531,7 @@ void VoxelMapManager::TransformLidar(const Eigen::Matrix3d rot, const Eigen::Vec
   }
 }
 
-void VoxelMapManager::BuildVoxelMap()
+void VoxelMapManager::BuildVoxelMap(double timestamp)
 {
   float voxel_size = config_setting_.max_voxel_size_;
   float planer_threshold = config_setting_.planner_threshold_;
@@ -542,15 +544,20 @@ void VoxelMapManager::BuildVoxelMap()
   for (size_t i = 0; i < feats_down_world_->size(); i++)
   {
     pointWithVar pv;
+    pv.point_b << feats_down_body_->points[i].x, feats_down_body_->points[i].y,
+                  feats_down_body_->points[i].z;
+    pv.point_i = extR_ * pv.point_b + extT_;
     pv.point_w << feats_down_world_->points[i].x, feats_down_world_->points[i].y, feats_down_world_->points[i].z;
     V3D point_this(feats_down_body_->points[i].x, feats_down_body_->points[i].y, feats_down_body_->points[i].z);
     M3D var;
     calcBodyCov(point_this, config_setting_.dept_err_, config_setting_.beam_err_, var);
+    pv.body_var = var;
     M3D point_crossmat;
     point_crossmat << SKEW_SYM_MATRX(point_this);
     var = (state_.rot_end * extR_) * var * (state_.rot_end * extR_).transpose() +
           (-point_crossmat) * state_.cov.block<3, 3>(0, 0) * (-point_crossmat).transpose() + state_.cov.block<3, 3>(3, 3);
     pv.var = var;
+    pv.source_lidar_time = timestamp;
     input_points.push_back(pv);
   }
 
@@ -588,6 +595,17 @@ void VoxelMapManager::BuildVoxelMap()
   {
     iter->second->init_octo_tree();
   }
+  if (feedback_mapping_enabled_ && timestamp >= 0.0)
+  {
+    FeedbackScan scan;
+    scan.timestamp = timestamp;
+    scan.rotation = state_.rot_end;
+    scan.translation = state_.pos_end;
+    scan.points = std::move(input_points);
+    feedback_scans_.push_back(std::move(scan));
+    active_voxel_map_.swap(voxel_map_);
+    RefreshCombinedMap();
+  }
 }
 
 V3F VoxelMapManager::RGBFromVoxel(const V3D &input_point)
@@ -606,7 +624,80 @@ V3F VoxelMapManager::RGBFromVoxel(const V3D &input_point)
   return RGB;
 }
 
-void VoxelMapManager::UpdateVoxelMap(const std::vector<pointWithVar> &input_points)
+VoxelMapManager::~VoxelMapManager()
+{
+  if (feedback_mapping_enabled_)
+  {
+    DeleteVoxelMap(&active_voxel_map_);
+    DeleteVoxelMap(&frozen_voxel_map_);
+    voxel_map_.clear();
+  }
+  else DeleteVoxelMap(&voxel_map_);
+}
+
+void VoxelMapManager::DeleteVoxelMap(VoxelMap *map)
+{
+  for (auto &entry : *map) delete entry.second;
+  map->clear();
+}
+
+void VoxelMapManager::EnableFeedbackMapping(std::size_t max_active_scans)
+{
+  if (feedback_mapping_enabled_) return;
+  feedback_mapping_enabled_ = true;
+  feedback_max_active_scans_ = std::max<std::size_t>(2, max_active_scans);
+  frozen_voxel_map_.swap(voxel_map_);
+  RefreshCombinedMap();
+}
+
+const std::vector<pointWithVar> *VoxelMapManager::LatestActiveScanPoints(
+    double timestamp) const
+{
+  for (auto it = feedback_scans_.rbegin(); it != feedback_scans_.rend(); ++it)
+    if (it->keyframe_id != 0 && it->timestamp <= timestamp + 1.0e-6)
+      return &it->points;
+  return nullptr;
+}
+
+void VoxelMapManager::RefreshCombinedMap()
+{
+  voxel_map_ = frozen_voxel_map_;
+  OverlayActiveMap();
+}
+
+void VoxelMapManager::RestoreFrozenMapForActiveKeys()
+{
+  for (const auto &entry : active_voxel_map_)
+  {
+    auto combined = voxel_map_.find(entry.first);
+    if (combined == voxel_map_.end() || combined->second != entry.second)
+      continue;
+    const auto frozen = frozen_voxel_map_.find(entry.first);
+    if (frozen == frozen_voxel_map_.end()) voxel_map_.erase(combined);
+    else combined->second = frozen->second;
+  }
+}
+
+void VoxelMapManager::OverlayActiveMap()
+{
+  for (const auto &entry : active_voxel_map_)
+    OverlayActiveKey(entry.first);
+}
+
+void VoxelMapManager::OverlayActiveKey(const VOXEL_LOCATION &key)
+{
+  const auto active = active_voxel_map_.find(key);
+  if (active == active_voxel_map_.end()) return;
+  const auto frozen = frozen_voxel_map_.find(key);
+  if (frozen == frozen_voxel_map_.end() ||
+      active->second->plane_ptr_->is_plane_ || active->second->octo_state_ == 1)
+    voxel_map_[key] = active->second;
+  else voxel_map_[key] = frozen->second;
+}
+
+void VoxelMapManager::InsertPoints(VoxelMap &map,
+                                    const std::vector<pointWithVar> &input_points,
+                                    std::unordered_set<VOXEL_LOCATION> *touched)
 {
   float voxel_size = config_setting_.max_voxel_size_;
   float planer_threshold = config_setting_.planner_threshold_;
@@ -624,20 +715,139 @@ void VoxelMapManager::UpdateVoxelMap(const std::vector<pointWithVar> &input_poin
       if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
     }
     VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
-    auto iter = voxel_map_.find(position);
-    if (iter != voxel_map_.end()) { voxel_map_[position]->UpdateOctoTree(p_v); }
+    if (touched) touched->insert(position);
+    auto iter = map.find(position);
+    if (iter != map.end()) { iter->second->UpdateOctoTree(p_v); }
     else
     {
       VoxelOctoTree *octo_tree = new VoxelOctoTree(max_layer, 0, layer_init_num[0], max_points_num, planer_threshold);
-      voxel_map_[position] = octo_tree;
-      voxel_map_[position]->layer_init_num_ = layer_init_num;
-      voxel_map_[position]->quater_length_ = voxel_size / 4;
-      voxel_map_[position]->voxel_center_[0] = (0.5 + position.x) * voxel_size;
-      voxel_map_[position]->voxel_center_[1] = (0.5 + position.y) * voxel_size;
-      voxel_map_[position]->voxel_center_[2] = (0.5 + position.z) * voxel_size;
-      voxel_map_[position]->UpdateOctoTree(p_v);
+      map[position] = octo_tree;
+      octo_tree->layer_init_num_ = layer_init_num;
+      octo_tree->quater_length_ = voxel_size / 4;
+      octo_tree->voxel_center_[0] = (0.5 + position.x) * voxel_size;
+      octo_tree->voxel_center_[1] = (0.5 + position.y) * voxel_size;
+      octo_tree->voxel_center_[2] = (0.5 + position.z) * voxel_size;
+      octo_tree->UpdateOctoTree(p_v);
     }
   }
+}
+
+void VoxelMapManager::RebuildActiveMap()
+{
+  RestoreFrozenMapForActiveKeys();
+  DeleteVoxelMap(&active_voxel_map_);
+  for (const auto &scan : feedback_scans_)
+    InsertPoints(active_voxel_map_, scan.points);
+  OverlayActiveMap();
+}
+
+void VoxelMapManager::UpdateVoxelMap(const std::vector<pointWithVar> &input_points,
+                                      double timestamp, std::uint64_t keyframe_id)
+{
+  if (!feedback_mapping_enabled_)
+  {
+    InsertPoints(voxel_map_, input_points);
+    return;
+  }
+  if (!std::isfinite(timestamp) || timestamp < 0.0)
+  {
+    ROS_ERROR_ONCE("Feedback voxel map requires a valid scan timestamp.");
+    return;
+  }
+  if (keyframe_id == 0 || committed_scan_ids_.count(keyframe_id) ||
+      std::any_of(feedback_scans_.begin(), feedback_scans_.end(),
+          [keyframe_id](const FeedbackScan &scan) {
+            return scan.keyframe_id == keyframe_id;
+          })) return;
+  FeedbackScan scan;
+  scan.keyframe_id = keyframe_id;
+  scan.timestamp = timestamp;
+  scan.rotation = state_.rot_end;
+  scan.translation = state_.pos_end;
+  scan.points = input_points;
+  for (auto &point : scan.points)
+    point.point_i = extR_ * point.point_b + extT_;
+  const auto bootstrap = std::find_if(feedback_scans_.begin(),
+      feedback_scans_.end(), [](const FeedbackScan &cached) {
+        return cached.keyframe_id == 0;
+      });
+  if (bootstrap != feedback_scans_.end())
+  {
+    feedback_scans_.erase(bootstrap);
+    feedback_scans_.push_back(std::move(scan));
+    RebuildActiveMap();
+  }
+  else
+  {
+    feedback_scans_.push_back(std::move(scan));
+    std::unordered_set<VOXEL_LOCATION> touched;
+    InsertPoints(active_voxel_map_, feedback_scans_.back().points, &touched);
+    for (const auto &key : touched) OverlayActiveKey(key);
+  }
+  if (feedback_scans_.size() > feedback_max_active_scans_)
+    ROS_WARN_STREAM_THROTTLE(5.0, "Active keyframe scans exceed the configured "
+        "warning limit: " << feedback_scans_.size() << "/" << feedback_max_active_scans_);
+}
+
+VoxelMapManager::ScanSyncResult VoxelMapManager::SyncKeyframeScans(
+    const std::map<std::uint64_t, fast_livo::adaptive_window::NavState> &active,
+    const std::vector<fast_livo::adaptive_window::RetiredFrame> &retired,
+    double min_translation, double min_rotation_deg)
+{
+  ScanSyncResult result;
+  if (!feedback_mapping_enabled_) return result;
+  std::unordered_set<VOXEL_LOCATION> committed_keys;
+  for (const auto &frame : retired)
+  {
+    if (!frame.id || committed_scan_ids_.count(frame.id)) continue;
+    const auto scan = std::find_if(feedback_scans_.begin(),
+        feedback_scans_.end(), [&frame](const FeedbackScan &candidate) {
+          return candidate.keyframe_id == frame.id;
+        });
+    if (scan == feedback_scans_.end()) continue;  // image-only keyframe
+    const M3D final_rotation = frame.optimized.q_w_i.toRotationMatrix();
+    const M3D delta = final_rotation * scan->rotation.transpose();
+    for (auto &point : scan->points)
+    {
+      point.point_w = final_rotation * point.point_i + frame.optimized.p_w_i;
+      point.var = delta * point.var * delta.transpose();
+      if (point.normal.squaredNorm() > 0.0) point.normal = delta * point.normal;
+    }
+    InsertPoints(frozen_voxel_map_, scan->points, &committed_keys);
+    committed_scan_ids_.insert(frame.id);
+    feedback_scans_.erase(scan);
+    ++result.committed;
+  }
+  const double min_rotation_rad = min_rotation_deg * M_PI / 180.0;
+  for (auto &scan : feedback_scans_)
+  {
+    if (scan.keyframe_id == 0) continue;
+    const auto estimate = active.find(scan.keyframe_id);
+    if (estimate == active.end()) continue;
+    const M3D target_rotation = estimate->second.q_w_i.toRotationMatrix();
+    const M3D delta = target_rotation * scan.rotation.transpose();
+    if ((estimate->second.p_w_i - scan.translation).norm() <= min_translation &&
+        Eigen::AngleAxisd(delta).angle() <= min_rotation_rad) continue;
+    for (auto &point : scan.points)
+    {
+      point.point_w = target_rotation * point.point_i + estimate->second.p_w_i;
+      point.var = delta * point.var * delta.transpose();
+      if (point.normal.squaredNorm() > 0.0) point.normal = delta * point.normal;
+    }
+    scan.rotation = target_rotation;
+    scan.translation = estimate->second.p_w_i;
+    ++result.corrected;
+  }
+  if (result.corrected || result.committed) RebuildActiveMap();
+  // RebuildActiveMap restores cells that were previously active. A newly
+  // frozen voxel may not have existed in that view, so expose every committed
+  // cell as well (including an active/frozen overlap).
+  for (const auto &key : committed_keys)
+  {
+    if (active_voxel_map_.count(key)) OverlayActiveKey(key);
+    else voxel_map_[key] = frozen_voxel_map_.at(key);
+  }
+  return result;
 }
 
 void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, std::vector<PointToPlane> &ptpl_list)
@@ -645,15 +855,13 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
   int max_layer = config_setting_.max_layer_;
   double voxel_size = config_setting_.max_voxel_size_;
   double sigma_num = config_setting_.sigma_num_;
-  std::mutex mylock;
   ptpl_list.clear();
   std::vector<PointToPlane> all_ptpl_list(pv_list.size());
-  std::vector<bool> useful_ptpl(pv_list.size());
+  std::vector<std::uint8_t> useful_ptpl(pv_list.size(), 0);
   std::vector<size_t> index(pv_list.size());
   for (size_t i = 0; i < index.size(); ++i)
   {
     index[i] = i;
-    useful_ptpl[i] = false;
   }
   #ifdef MP_EN
     omp_set_num_threads(MP_PROC_NUM);
@@ -676,7 +884,26 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
       PointToPlane single_ptpl;
       bool is_sucess = false;
       double prob = 0;
-      build_single_residual(pv, current_octo, 0, is_sucess, prob, single_ptpl);
+      const auto match_key = [&](const VOXEL_LOCATION &key) {
+        if (!feedback_mapping_enabled_)
+        {
+          const auto candidate = voxel_map_.find(key);
+          if (candidate != voxel_map_.end())
+            build_single_residual(pv, candidate->second, 0,
+                                  is_sucess, prob, single_ptpl);
+          return;
+        }
+        // A temporary scan and a finalized scan may occupy the same voxel.
+        // Query both plane trees and retain the highest likelihood match.
+        for (const VoxelMap *map : {&frozen_voxel_map_, &active_voxel_map_})
+        {
+          const auto candidate = map->find(key);
+          if (candidate != map->end())
+            build_single_residual(pv, candidate->second, 0,
+                                  is_sucess, prob, single_ptpl);
+        }
+      };
+      match_key(position);
       if (!is_sucess)
       {
         VOXEL_LOCATION near_position = position;
@@ -686,21 +913,12 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
         else if (loc_xyz[1] < (current_octo->voxel_center_[1] - current_octo->quater_length_)) { near_position.y = near_position.y - 1; }
         if (loc_xyz[2] > (current_octo->voxel_center_[2] + current_octo->quater_length_)) { near_position.z = near_position.z + 1; }
         else if (loc_xyz[2] < (current_octo->voxel_center_[2] - current_octo->quater_length_)) { near_position.z = near_position.z - 1; }
-        auto iter_near = voxel_map_.find(near_position);
-        if (iter_near != voxel_map_.end()) { build_single_residual(pv, iter_near->second, 0, is_sucess, prob, single_ptpl); }
+        match_key(near_position);
       }
       if (is_sucess)
       {
-        mylock.lock();
-        useful_ptpl[i] = true;
+        useful_ptpl[i] = 1;
         all_ptpl_list[i] = single_ptpl;
-        mylock.unlock();
-      }
-      else
-      {
-        mylock.lock();
-        useful_ptpl[i] = false;
-        mylock.unlock();
       }
     }
   }
@@ -949,6 +1167,45 @@ void VoxelMapManager::mapSliding()
 
 void VoxelMapManager::clearMemOutOfMap(const int& x_max,const int& x_min,const int& y_max,const int& y_min,const int& z_max,const int& z_min )
 {
+  if (feedback_mapping_enabled_)
+  {
+    // Keep the reconstructible scan cache inside the same local-map bounds;
+    // otherwise a later backend correction could reintroduce slid-out cells.
+    for (auto it = feedback_scans_.begin(); it != feedback_scans_.end(); )
+    {
+      auto &points = it->points;
+      points.erase(std::remove_if(points.begin(), points.end(),
+          [&](const pointWithVar &point) {
+            float loc[3];
+            for (int j = 0; j < 3; ++j)
+            {
+              loc[j] = point.point_w[j] / config_setting_.max_voxel_size_;
+              if (loc[j] < 0) loc[j] -= 1.0;
+            }
+            return loc[0] > x_max || loc[0] < x_min ||
+                   loc[1] > y_max || loc[1] < y_min ||
+                   loc[2] > z_max || loc[2] < z_min;
+          }), points.end());
+      if (points.empty()) it = feedback_scans_.erase(it);
+      else ++it;
+    }
+    for (VoxelMap *map : {&frozen_voxel_map_, &active_voxel_map_})
+    {
+      for (auto it = map->begin(); it != map->end(); )
+      {
+        const VOXEL_LOCATION &loc = it->first;
+        if (loc.x > x_max || loc.x < x_min || loc.y > y_max ||
+            loc.y < y_min || loc.z > z_max || loc.z < z_min)
+        {
+          delete it->second;
+          it = map->erase(it);
+        }
+        else ++it;
+      }
+    }
+    RefreshCombinedMap();
+    return;
+  }
   int delete_voxel_cout = 0;
   // double delete_time = 0;
   // double last_delete_time = 0;

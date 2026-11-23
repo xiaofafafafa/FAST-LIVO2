@@ -7,12 +7,12 @@
 随后在 Ceres 版本 `df8ee2a3dfc59a4158a3adc4b19b9a1c17ae6c9e` 上按 VINS-Mono 命名组织为
 `Estimator` + `factor/`，并加入 FAST-LIVO2 位姿正则项。代码阅读顺序见
 [VINS 风格代码导航](VINS_STYLE_BACKEND.md)。
-逐文件中文说明、状态与内存关系及完整调用流程见
-[adaptive_window 中文代码框架与阅读指南](ADAPTIVE_WINDOW_CODE_GUIDE_CN.md)。
 
-**当前是未完成编译和数据集验证的研究实现。** 开发环境没有 ROS、Eigen、Ceres 或
-CMake，依赖安装受限；下文的 C++ 测试已编写，但未在该环境执行。不能据此声称精度提高、
-实时性达标或论文算法已经验证。请先通过 standalone 测试，再在 ROS 工作空间编译和回放。
+**当前仍是研究实现。** 2026-11-13 在 ROS Noetic、Eigen 3.3.7、Ceres 1.14 上
+完成 standalone 和 catkin 编译，合成后端测试通过；当时的执行环境阻止启动 ROS Master。
+2026-11-16 已在当前 ROS 环境中完整回放 NTU VIRAL `eee_01`，精度结果见
+[NTU 评估记录](NTU_ADAPTIVE_EVALUATION.md)：滑窗输出可以独立运行，但此配置下
+其平移 APE 高于 FAST-LIVO2 前端，不能声称精度提高。
 
 FAST-LIVO2 的 ESIKF 前端、去畸变和地图仍正常运行。本模块在同一处理线程内同步执行，
 产生另一条后端里程计；“独立输出”不代表独立线程，也不是完整的后端地图重优化。
@@ -232,8 +232,8 @@ r_{F,i} =
 
 ## 4. 构建与运行
 
-最低新增要求：C++17、CMake 3.16、Eigen 3.3、**Ceres 2.1**。
-使用的是 Ceres Manifold API；只有 Ceres 1.x 的 ROS 环境必须先升级。
+最低新增要求：C++17、CMake 3.16、Eigen 3.3、**Ceres 1.14**。
+Ceres 1.x/2.0 使用 LocalParameterization，2.1+ 使用 Manifold；本工作空间已验证 1.14。
 本分支即使不启用后端，构建时也需要 Ceres。选择版本时需兼容你的 ROS 发行版和工具链。
 
 ### 先运行不依赖 ROS 的核心测试
@@ -244,7 +244,7 @@ r_{F,i} =
 cmake -S . -B build-aw -DADAPTIVE_WINDOW_STANDALONE=ON \
   -DBUILD_TESTING=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build-aw -j2
-ctest --test-dir build-aw --output-on-failure
+(cd build-aw && ctest --output-on-failure)
 ~~~
 
 非系统安装 Ceres 时，可在第一条命令追加 `-DCeres_DIR=/实际路径/lib/cmake/Ceres`。
@@ -254,18 +254,61 @@ ctest --test-dir build-aw --output-on-failure
 中间帧/最旧帧边缘化、参考帧与深度共同淘汰、同步与异步合成轨迹、
 重复图像不重复建因子以及窗口上界；另覆盖位姿正则 Jacobian、四元数符号不变性、
 同一时刻参考替换、正则强度的一维解析解、开关、平移/旋转超限拒绝和状态回滚。
-这些是测试源代码中的检查项，当前环境尚未执行 C++ 测试。
+这些检查已在本工作空间的 Ceres 1.14 构建中通过。
 
 ### 再编译 ROS 集成
 
-将此仓库放在已有 FAST-LIVO2 依赖的 catkin workspace 中：
+在本工作空间根目录构建随附的 Sophus，再编译三个 catkin 包：
 
 ~~~bash
-cd /你的路径/catkin_ws
-catkin_make -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cd /home/zyf/catkin_fast_adaptive
+cmake -S third_party/Sophus -B build-sophus -DCMAKE_BUILD_TYPE=Release
+cmake --build build-sophus -j2
+catkin_make -j2 -DSophus_DIR="$PWD/build-sophus"
 source devel/setup.bash
-roslaunch fast_livo mapping_avia_adaptive.launch feedback:=false
 ~~~
+
+在允许本地套接字的终端回放 Livox PointCloud2 与 IMU bag，分别执行：
+
+~~~bash
+source /home/zyf/catkin_fast_adaptive/devel/setup.bash
+roslaunch fast_livo mapping_livox_pointcloud2_adaptive_lio.launch rviz:=true use_sim_time:=true
+~~~
+
+~~~bash
+rosbag play /home/zyf/2026-07-30-20-43-38.bag --clock --duration=30
+~~~
+
+该 bag 没有图像，因此此配置只验证 LiDAR–IMU 与后端的 LiDAR 路径；
+精度评估前需填入真实 LiDAR–IMU 外参。Avia 自定义消息与图像数据可使用原启动文件：
+
+~~~bash
+source /home/zyf/catkin_fast_adaptive/devel/setup.bash
+roslaunch fast_livo mapping_avia_adaptive.launch rviz:=true feedback:=false
+~~~
+
+NTU VIRAL `eee_01` 可用独立的 Ouster 启动文件；它将前端轨迹保存为
+`Log/result/eee_01_adaptive_frontend.txt`，将成功求解的滑窗状态保存为
+`Log/result/eee_01_adaptive_backend.txt`。该启动文件在通用后端参数之后加载
+`config/adaptive_window_ntu.yaml`，使用与 NTU 前端方差尺度一致的 IMU 标准差，
+限制重复地图点面观测的总权重。终端一：
+
+~~~bash
+source /home/zyf/catkin_fast_adaptive/devel/setup.bash
+roslaunch fast_livo mapping_ouster_ntu_adaptive.launch rviz:=false
+~~~
+
+终端二：
+
+~~~bash
+rosbag play /home/zyf/catkin_fast_adaptive/eee_01/eee_01.bag --clock \
+  --topics /left/image_raw /imu/imu /os1_cloud_node1/points
+~~~
+
+用 NTU 的 Leica 棱镜 GT 比较之前，先按 `eee_01/leica_prism.yaml` 中的
+`T_Body_Prism` 将两条 IMU 轨迹转换到棱镜位置；脚本
+`scripts/transform_ntu_tum_to_prism.py` 执行该转换。GT 四元数全是单位占位值，
+因此只比较平移误差。
 
 请按你实际相机/激光型号替换 launch 中的传感器 YAML 和话题；
 当前示例继承 Avia 数据配置。可先减小 `max_lidar_factors`、
@@ -278,6 +321,11 @@ roslaunch fast_livo mapping_avia_adaptive.launch feedback:=false
 - `/adaptive_window/odometry`：最新保留状态的实际时间戳，不伪装成当前输入帧的时间。
   pose 在 `camera_init` 系，线速度按 ROS odometry 约定转到 `body` 系。
   本版不输出可信的后端协方差；不要将默认零 covariance 当成确定性。
+- `/adaptive_window/optimized_odometry`：仅在滑窗完成一次被接受的求解后发布，
+  位姿与 `/adaptive_window/odometry` 使用同一世界坐标系。`adaptive_window/pose_output_en`
+  为 true 时，还按 TUM 格式写入 `adaptive_window/pose_output_path`；若路径为空，
+  使用 `Log/result/<evo/seq_name>_adaptive.txt`。同一时间戳的后续求解会更新
+  文件中待写入的位姿，因此文件保留该时间戳最后一次被接受的结果。
 - `/adaptive_window/camera_imu_extrinsic`：parent=imu、child=camera_adaptive，
   消息内容为 \(T_{IC}\)，内部优化变量为其逆 \(T_{CI}\)。只是消息，不自动发布 TF。
 - `/adaptive_window/diagnostics`：Float64MultiArray，前 17 项保持此前 Ceres 版本的字段顺序。

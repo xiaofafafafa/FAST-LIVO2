@@ -37,6 +37,7 @@ public:
   std::deque<sensor_msgs::Imu::ConstPtr> backendImuMeasurements(double timestamp);
   void handleVIO();
   void handleLIO();
+  bool applyAdaptiveFeedback(double timestamp, bool solved, bool vision_event);
   void savePCD();
   void processImu();
   
@@ -125,7 +126,6 @@ public:
   deque<sensor_msgs::Imu::ConstPtr> imu_buffer;
   deque<cv::Mat> img_buffer;
   deque<double> img_time_buffer;
-  vector<pointWithVar> _pv_list;
   vector<double> extrinT;
   vector<double> extrinR;
   vector<double> cameraextrinT;
@@ -161,6 +161,11 @@ public:
   VoxelMapManagerPtr voxelmap_manager;
   VIOManagerPtr vio_manager;
   std::unique_ptr<fast_livo::adaptive_window::FastLivoBridge> adaptive_window_bridge;
+  std::size_t feedback_applications_ = 0;
+  double last_lidar_scan_time_ = -1.0;
+  std::size_t lidar_keyframes_ = 0;
+  std::size_t visual_keyframes_ = 0;
+  std::size_t retired_lidar_scans_ = 0;
 
   ros::Publisher plane_pub;
   ros::Publisher voxel_pub;

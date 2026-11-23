@@ -14,16 +14,19 @@ which is included as part of this source code package.
 #define VOXEL_MAP_H_
 
 #include "common_lib.h"
+#include "adaptive_window/types.h"
 #include <Eigen/Dense>
+#include <deque>
 #include <fstream>
+#include <map>
 #include <math.h>
-#include <mutex>
 #include <omp.h>
 #include <pcl/common/io.h>
 #include <ros/ros.h>
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
 
@@ -225,15 +228,31 @@ public:
     feats_down_body_.reset(new PointCloudXYZI());
     feats_down_world_.reset(new PointCloudXYZI());
   };
+  ~VoxelMapManager();
 
   void StateEstimation(StatesGroup &state_propagat);
   void TransformLidar(const Eigen::Matrix3d rot, const Eigen::Vector3d t, const PointCloudXYZI::Ptr &input_cloud,
                       pcl::PointCloud<pcl::PointXYZI>::Ptr &trans_cloud);
 
-  void BuildVoxelMap();
+  void BuildVoxelMap(double timestamp = -1.0);
   V3F RGBFromVoxel(const V3D &input_point);
 
-  void UpdateVoxelMap(const std::vector<pointWithVar> &input_points);
+  void UpdateVoxelMap(const std::vector<pointWithVar> &input_points,
+                      double timestamp = -1.0,
+                      std::uint64_t keyframe_id = 0);
+  void EnableFeedbackMapping(std::size_t max_active_scans);
+  struct ScanSyncResult {
+    std::size_t corrected = 0;
+    std::size_t committed = 0;
+  };
+  ScanSyncResult SyncKeyframeScans(
+      const std::map<std::uint64_t, fast_livo::adaptive_window::NavState> &active,
+      const std::vector<fast_livo::adaptive_window::RetiredFrame> &retired,
+      double min_translation, double min_rotation_deg);
+  std::size_t active_scan_count() const { return feedback_scans_.size(); }
+  std::size_t committed_scan_count() const { return committed_scan_ids_.size(); }
+  const std::vector<pointWithVar> *LatestActiveScanPoints(double timestamp) const;
+  bool feedback_mapping_enabled() const { return feedback_mapping_enabled_; }
 
   void BuildResidualListOMP(std::vector<pointWithVar> &pv_list, std::vector<PointToPlane> &ptpl_list);
 
@@ -246,6 +265,27 @@ public:
   void clearMemOutOfMap(const int& x_max,const int& x_min,const int& y_max,const int& y_min,const int& z_max,const int& z_min );
 
 private:
+  using VoxelMap = std::unordered_map<VOXEL_LOCATION, VoxelOctoTree *>;
+  struct FeedbackScan {
+    std::uint64_t keyframe_id = 0;  // zero is the provisional bootstrap scan
+    double timestamp = -1.0;
+    M3D rotation = M3D::Identity();
+    V3D translation = V3D::Zero();
+    std::vector<pointWithVar> points;
+  };
+  bool feedback_mapping_enabled_ = false;
+  std::size_t feedback_max_active_scans_ = 100;
+  VoxelMap frozen_voxel_map_, active_voxel_map_;
+  std::deque<FeedbackScan> feedback_scans_;
+  std::unordered_set<std::uint64_t> committed_scan_ids_;
+  void InsertPoints(VoxelMap &map, const std::vector<pointWithVar> &points,
+                    std::unordered_set<VOXEL_LOCATION> *touched = nullptr);
+  void RebuildActiveMap();
+  void RestoreFrozenMapForActiveKeys();
+  void OverlayActiveMap();
+  void OverlayActiveKey(const VOXEL_LOCATION &key);
+  void RefreshCombinedMap();
+  static void DeleteVoxelMap(VoxelMap *map);
   void GetUpdatePlane(const VoxelOctoTree *current_octo, const int pub_max_voxel_layer, std::vector<VoxelPlane> &plane_list);
 
   void pubSinglePlane(visualization_msgs::MarkerArray &plane_pub, const std::string plane_ns, const VoxelPlane &single_plane, const float alpha,

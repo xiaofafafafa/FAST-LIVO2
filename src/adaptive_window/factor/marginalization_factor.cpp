@@ -1,8 +1,3 @@
-/**
- * @file marginalization_factor.cpp
- * @brief 构建局部正规方程、Schur 消元与平方根先验；只冻结被吸收信息的线性化。
- * 中文框架说明：docs/ADAPTIVE_WINDOW_CODE_GUIDE_CN.md。
- */
 #include "adaptive_window/factor/marginalization_factor.h"
 #include "adaptive_window/factor/pose_local_parameterization.h"
 #include <ceres/dynamic_autodiff_cost_function.h>
@@ -14,7 +9,6 @@ namespace fast_livo { namespace adaptive_window {
 namespace {
 // Only the marginalized information is fixed at its linearization point. All
 // retained measurement factors remain nonlinear and are re-evaluated by Ceres.
-// 固定线性化先验：r=A*delta+b；delta 对位姿用流形差，对其他变量用普通差。
 struct MarginalizationFactor {
   std::vector<BlockKey> keys;
   std::vector<std::vector<double>> references;
@@ -26,7 +20,6 @@ struct MarginalizationFactor {
     for (std::size_t k = 0; k < keys.size(); ++k) {
       const auto &base = references[k];
       if (keys[k].is_pose()) {
-        // 不能直接相减四元数四个分量；位姿局部排列仍为 [dp,dtheta]。
         delta.template segment<3>(offset) = Position(x[k]) - Position(base.data()).cast<T>();
         delta.template segment<3>(offset + 3) = QuaternionLog(
             Rotation(base.data()).cast<T>().conjugate() * Rotation(x[k]));
@@ -44,7 +37,6 @@ struct MarginalizationFactor {
 // Diagonal equilibration prevents position/bias unit differences from deciding
 // the eigenvalue truncation. Null directions are discarded, never damped into
 // artificial information. The 1e-9 cutoff applies to the scaled matrix.
-// D=diag(1/sqrt(|H_ii|))，对 D*H*D 分解以减轻单位差异影响，再在均衡坐标舍弃弱方向。
 bool Spectrum(const Eigen::MatrixXd &h, Eigen::VectorXd *scale,
               Eigen::VectorXd *values, Eigen::MatrixXd *vectors) {
   if (h.rows() == 0 || !h.allFinite()) return false;
@@ -53,13 +45,11 @@ bool Spectrum(const Eigen::MatrixXd &h, Eigen::VectorXd *scale,
   Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eigen(normalized);
   if (eigen.info() != Eigen::Success) return false;
   *values = eigen.eigenvalues(); *vectors = eigen.eigenvectors();
-  // 小于 1e-9 的特征值截断为零，包括微小负值；不加 LM 阻尼来制造先验信息。
   for (int k = 0; k < values->size(); ++k) if ((*values)[k] < 1e-9) (*values)[k] = 0.0;
   return true;
 }
 }
 
-// 通用非线性求值和局部 Jacobian 转换；各因子统一使用此路径参与边缘化。
 bool ResidualBlockInfo::Evaluate(const ParameterValues &values, Eigen::VectorXd *r,
                                  std::vector<Eigen::MatrixXd> *local_j) const {
   const auto &f = *this;
@@ -69,7 +59,6 @@ bool ResidualBlockInfo::Evaluate(const ParameterValues &values, Eigen::VectorXd 
   std::vector<const double *> parameters;
   std::vector<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> ambient;
   std::vector<double *> jacobians;
-  // 先预留矩阵容器，防止循环扩容时使已记录的 Jacobian 数据指针失效。
   ambient.reserve(f.keys.size());
   for (const auto &key : f.keys) {
     const auto it = values.find(key); if (it == values.end()) return false;
@@ -85,7 +74,6 @@ bool ResidualBlockInfo::Evaluate(const ParameterValues &values, Eigen::VectorXd 
       if (f.keys[k].is_pose()) {
         Eigen::Matrix<double, 7, 6, Eigen::RowMajor> plus;
         local_parameterization.PlusJacobian(parameters[k], plus.data());
-        // 链式法则 J_local=J_ambient*J_plus，位姿从 7 列转换成 6 列。
         local_j->push_back(ambient[k] * plus);
       } else local_j->push_back(ambient[k]);
     }
@@ -93,7 +81,6 @@ bool ResidualBlockInfo::Evaluate(const ParameterValues &values, Eigen::VectorXd 
   return true;
 }
 
-// Ceres 构图和边缘化使用相同的损失外权重；滤波位姿的独立权重存于 confidence。
 double residualWeight(const ResidualBlockInfo &f, const ModalityWeights &weights) {
   double weight = 1.0;
   if (f.modality == Modality::kLidar) weight = weights.lidar;
@@ -102,11 +89,9 @@ double residualWeight(const ResidualBlockInfo &f, const ModalityWeights &weights
   // Frontend pose regularization has its own explicit weight in confidence.
   return weight * f.confidence;
 }
-// 此处只收集描述，直到 preMarginalize 才统一选择线性化点并求值。
 void MarginalizationInfo::addResidualBlockInfo(const ResidualBlockInfo &factor) {
   factors_.push_back(factor);
 }
-// 按 [待删 m,保留 n] 排列局部变量，拷贝保留变量的当前环境维度数值作为 x0。
 bool MarginalizationInfo::preMarginalize(const ParameterValues &parameters,
     const std::set<BlockKey> &drop_set, const ModalityWeights &weights) {
   keep_block_keys.clear(); keep_block_data.clear();
@@ -117,13 +102,11 @@ bool MarginalizationInfo::preMarginalize(const ParameterValues &parameters,
   if (keep.empty() || drop_set.empty()) return false;
   std::map<BlockKey, int> offsets;
   int dimension = 0;
-  // offset 按 local_size 累加；位姿虽然存 7 维，但只占 6 个消元自由度。
   for (const auto &key : drop_set) { offsets[key] = dimension; dimension += key.local_size(); }
   marginalized_size_ = dimension;
   for (const auto &key : keep) {
     if (!parameters.count(key)) return false;
     offsets[key] = dimension; dimension += key.local_size();
-    // 保留线性化基点的数值副本，不能保存之后会变化或释放的数组地址作为基点。
     keep_block_keys.push_back(key); keep_block_data.push_back(parameters.at(key));
   }
   hessian_ = Eigen::MatrixXd::Zero(dimension, dimension);
@@ -132,11 +115,9 @@ bool MarginalizationInfo::preMarginalize(const ParameterValues &parameters,
     Eigen::VectorXd r; std::vector<Eigen::MatrixXd> jacobians;
     if (!f.Evaluate(parameters, &r, &jacobians)) return false;
     double weight = residualWeight(f, weights);
-    // 冻结本次 Huber 一阶 IRLS 权重：大残差乘 delta/||r||；不再随之后状态追溯更新。
     if (f.huber_delta > 0.0 && r.norm() > f.huber_delta) weight *= f.huber_delta / r.norm();
     for (std::size_t i = 0; i < f.keys.size(); ++i) {
       const int oi = offsets.at(f.keys[i]), ni = f.keys[i].local_size();
-      // g=Σw*J^T*r，H=Σw*J^T*J；正规方程是 H*dx=-g，注意梯度符号。
       gradient_.segment(oi, ni).noalias() += weight * jacobians[i].transpose() * r;
       for (std::size_t j = 0; j < f.keys.size(); ++j) {
         const int oj = offsets.at(f.keys[j]), nj = f.keys[j].local_size();
@@ -146,31 +127,26 @@ bool MarginalizationInfo::preMarginalize(const ParameterValues &parameters,
   }
   return hessian_.allFinite() && gradient_.allFinite();
 }
-// Schur 消元：H_p=H_nn-H_nm*H_mm^-*H_mn，g_p=g_n-H_nm*H_mm^-*g_m。
 bool MarginalizationInfo::marginalize() {
   const int m = marginalized_size_, n = static_cast<int>(hessian_.rows()) - m;
   if (m <= 0 || n <= 0) return false;
   Eigen::VectorXd scale, values; Eigen::MatrixXd vectors;
   if (!Spectrum(hessian_.topLeftCorner(m, m), &scale, &values, &vectors)) return false;
   const Eigen::VectorXd inverse = values.unaryExpr([](double v) { return v > 0 ? 1.0 / v : 0.0; });
-  // 在均衡坐标对可观方向取逆，随后映回原坐标，零空间保持为零。
   const Eigen::MatrixXd pinv = scale.asDiagonal() * vectors * inverse.asDiagonal() * vectors.transpose() * scale.asDiagonal();
   const Eigen::MatrixXd cross = hessian_.topRightCorner(m, n);
   const Eigen::MatrixXd reduced = hessian_.bottomRightCorner(n, n) - cross.transpose() * pinv * cross;
   const Eigen::VectorXd gradient = gradient_.tail(n) - cross.transpose() * pinv * gradient_.head(m);
   if (!gradient.allFinite() || !Spectrum(reduced, &scale, &values, &vectors)) return false;
-  // 由剩余系统的特征分解构造平方根：A^T*A≈H_p，A^T*b≈g_p。
   const Eigen::VectorXd roots = values.cwiseSqrt();
   const Eigen::VectorXd invroots = roots.unaryExpr([](double v) { return v > 0 ? 1.0 / v : 0.0; });
   linearized_jacobians = roots.asDiagonal() * vectors.transpose() * scale.cwiseInverse().asDiagonal();
   linearized_residuals = invroots.asDiagonal() * vectors.transpose() * scale.asDiagonal() * gradient;
   // Drop original costs/images after absorption. The next prior must not retain
   // a chain of historical image buffers through last_marginalization_info.
-  // 释放已吸收 cost 及其图像引用，避免每轮先验通过 shared_ptr 形成无限历史链。
   factors_.clear(); hessian_.resize(0, 0); gradient_.resize(0);
   return linearized_jacobians.allFinite() && linearized_residuals.allFinite();
 }
-// 将已完成的 A、b、x0 封装为动态自动微分 cost；空/失败结果返回无 cost 描述。
 ResidualBlockInfo MarginalizationInfo::getFactor() const {
   ResidualBlockInfo f;
   if (linearized_residuals.size() == 0) return f;

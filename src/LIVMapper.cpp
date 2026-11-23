@@ -150,6 +150,9 @@ void LIVMapper::initializeComponents()
   adaptive_window_bridge.reset(
       new fast_livo::adaptive_window::FastLivoBridge(
           adaptive_node_handle, extR, extT, vio_manager));
+  if (adaptive_window_bridge->feedback_enabled())
+    voxelmap_manager->EnableFeedbackMapping(
+        adaptive_window_bridge->config().feedback_max_active_scans);
 
   p_imu->set_extrinsic(extT, extR);
   p_imu->set_gyr_cov_scale(V3D(gyr_cov, gyr_cov, gyr_cov));
@@ -298,6 +301,114 @@ std::deque<sensor_msgs::Imu::ConstPtr> LIVMapper::backendImuMeasurements(double 
   return samples;
 }
 
+bool LIVMapper::applyAdaptiveFeedback(double timestamp, bool solved,
+                                      bool vision_event)
+{
+  if (!solved || !adaptive_window_bridge ||
+      !adaptive_window_bridge->feedback_enabled()) return false;
+  fast_livo::adaptive_window::NavState estimate;
+  std::vector<fast_livo::adaptive_window::PoseCorrection> corrections;
+  std::vector<fast_livo::adaptive_window::RetiredFrame> retired;
+  if (!adaptive_window_bridge->CollectFeedback(
+          timestamp, _state, &estimate, &corrections, &retired))
+  {
+    retired_lidar_scans_ += voxelmap_manager->SyncKeyframeScans(
+        {}, retired, 0.0, 0.0).committed;
+    vio_manager->FreezeRetiredAnchors(retired);
+    return false;
+  }
+
+  const M3D previous_rotation = _state.rot_end;
+  const V3D previous_position = _state.pos_end;
+  _state.rot_end = estimate.q_w_i.normalized().toRotationMatrix();
+  _state.pos_end = estimate.p_w_i;
+  _state.vel_end = estimate.v_w_i;
+  _state.bias_g = estimate.bias_g;
+  _state.bias_a = estimate.bias_a;
+  _state.gravity = estimate.gravity_w;
+
+  // The smoother reuses frontend observations and its pose prior. Do not fuse
+  // its marginal covariance as an independent measurement. Preserve the EKF
+  // covariance and add bounded correction uncertainty before propagation.
+  const double angle = Eigen::AngleAxisd(
+      Eigen::Quaterniond(previous_rotation.transpose() * _state.rot_end)).angle();
+  const double distance = (_state.pos_end - previous_position).norm();
+  const double inflation = adaptive_window_bridge->config().feedback_covariance_inflation;
+  _state.cov = 0.5 * (_state.cov + _state.cov.transpose()).eval();
+  _state.cov.block<3, 3>(0, 0).diagonal().array() +=
+      inflation * angle * angle / 3.0;
+  _state.cov.block<3, 3>(3, 3).diagonal().array() +=
+      inflation * distance * distance / 3.0;
+  state_propagat = _state;
+  voxelmap_manager->state_ = _state;
+  voxelmap_manager->position_last_ = _state.pos_end;
+
+  const auto scan_sync = voxelmap_manager->SyncKeyframeScans(
+      adaptive_window_bridge->ActiveKeyframeEstimates(), retired,
+      adaptive_window_bridge->config().feedback_map_min_translation,
+      adaptive_window_bridge->config().feedback_map_min_rotation_deg);
+  const std::size_t corrected_scans = scan_sync.corrected;
+  const std::size_t corrected_visual_points =
+      vio_manager->ApplyFeedbackCorrections(
+          corrections, adaptive_window_bridge->config().max_keyframe_dt);
+  retired_lidar_scans_ += scan_sync.committed;
+  vio_manager->FreezeRetiredAnchors(retired);
+  if (adaptive_window_bridge->config().optimize_extrinsics)
+  {
+    const auto extrinsic = adaptive_window_bridge->CameraExtrinsicEstimate();
+    vio_manager->ApplyOptimizedCameraExtrinsic(
+        extrinsic.q_c_i.normalized().toRotationMatrix(), extrinsic.p_c_i);
+  }
+  if (vision_event && vio_manager->new_frame_)
+    vio_manager->updateFrameState(_state);
+
+  auto correct_points = [&](std::vector<pointWithVar> *points) {
+    for (auto &point : *points)
+    {
+      fast_livo::adaptive_window::PoseCorrection correction;
+      if (!fast_livo::adaptive_window::CorrectionAt(
+              corrections, point.source_lidar_time,
+              adaptive_window_bridge->config().max_keyframe_dt,
+              &correction)) continue;
+      const M3D rotation = correction.rotation.toRotationMatrix();
+      point.point_w = rotation * point.point_w + correction.translation;
+      point.normal = rotation * point.normal;
+      point.var = rotation * point.var * rotation.transpose();
+    }
+  };
+  if (!corrections.empty())
+  {
+    correct_points(&voxelmap_manager->pv_list_);
+    fast_livo::adaptive_window::PoseCorrection correction;
+    if (last_lidar_scan_time_ >= 0.0 &&
+        fast_livo::adaptive_window::CorrectionAt(
+            corrections, last_lidar_scan_time_,
+            adaptive_window_bridge->config().max_keyframe_dt,
+            &correction))
+    {
+      const M3D rotation = correction.rotation.toRotationMatrix();
+      for (auto &point : pcl_w_wait_pub->points)
+      {
+        const V3D old(point.x, point.y, point.z);
+        const V3D updated = rotation * old + correction.translation;
+        point.x = updated.x();
+        point.y = updated.y();
+        point.z = updated.z();
+      }
+    }
+  }
+  ++feedback_applications_;
+  ROS_INFO_STREAM_THROTTLE(5.0,
+      "Adaptive feedback applied=" << feedback_applications_
+      << " correction_m=" << distance
+      << " correction_deg=" << angle * 180.0 / M_PI
+      << " rebuilt_scans=" << corrected_scans
+      << " visual_points=" << corrected_visual_points
+      << " active_scans=" << voxelmap_manager->active_scan_count()
+      << " committed_scans=" << retired_lidar_scans_);
+  return true;
+}
+
 void LIVMapper::handleVIO() 
 {
   euler_cur = RotMtoEuler(_state.rot_end);
@@ -322,7 +433,13 @@ void LIVMapper::handleVIO()
     vio_manager->plot_flag = false;
   }
 
-  vio_manager->processFrame(LidarMeasures.measures.back().img, _pv_list, voxelmap_manager->voxel_map_, LidarMeasures.last_lio_update_time - _first_lidar_time);
+  vio_manager->setCurrentImageTimestamp(LidarMeasures.measures.back().vio_time);
+  const bool feedback_mapping = adaptive_window_bridge &&
+      adaptive_window_bridge->feedback_enabled();
+  vio_manager->processFrame(LidarMeasures.measures.back().img,
+      voxelmap_manager->pv_list_, voxelmap_manager->voxel_map_,
+      LidarMeasures.last_lio_update_time - _first_lidar_time,
+      !feedback_mapping);
 
   if (adaptive_window_bridge && adaptive_window_bridge->enabled())
   {
@@ -331,9 +448,20 @@ void LIVMapper::handleVIO()
         p_imu->IMU_mean_acc_norm > 1.0e-6
             ? G_m_s2 / p_imu->IMU_mean_acc_norm
             : 1.0;
-    adaptive_window_bridge->ProcessVision(
+    const bool solved = adaptive_window_bridge->ProcessVision(
         image_timestamp, _state, vio_manager,
         backendImuMeasurements(image_timestamp), acceleration_scale);
+    applyAdaptiveFeedback(image_timestamp, solved, true);
+    if (feedback_mapping && solved &&
+        adaptive_window_bridge->FrameIdAt(image_timestamp) != 0)
+    {
+      static const std::vector<pointWithVar> empty_scan;
+      const auto *keyframe_scan =
+          voxelmap_manager->LatestActiveScanPoints(image_timestamp);
+      if (vio_manager->CommitKeyframeMap(
+              keyframe_scan ? *keyframe_scan : empty_scan,
+              voxelmap_manager->voxel_map_)) ++visual_keyframes_;
+    }
   }
 
   if (imu_prop_enable) 
@@ -379,6 +507,7 @@ void LIVMapper::handleLIO()
   }
 
   double t0 = omp_get_wtime();
+  const double lidar_update_timestamp = LidarMeasures.measures.back().lio_time;
 
   downSizeFilterSurf.setInputCloud(feats_undistort);
   downSizeFilterSurf.filter(*feats_down_body);
@@ -394,28 +523,34 @@ void LIVMapper::handleLIO()
   if (!lidar_map_inited) 
   {
     lidar_map_inited = true;
-    voxelmap_manager->BuildVoxelMap();
+    voxelmap_manager->BuildVoxelMap(lidar_update_timestamp);
   }
 
   double t1 = omp_get_wtime();
 
   voxelmap_manager->StateEstimation(state_propagat);
   _state = voxelmap_manager->state_;
-  const double lidar_update_timestamp = LidarMeasures.measures.back().lio_time;
   for (auto &point : voxelmap_manager->pv_list_)
     point.source_lidar_time = lidar_update_timestamp;
-  _pv_list = voxelmap_manager->pv_list_;
-
+  bool lidar_keyframe = false;
+  std::uint64_t lidar_keyframe_id = 0;
   if (adaptive_window_bridge && adaptive_window_bridge->enabled())
   {
     const double acceleration_scale =
         p_imu->IMU_mean_acc_norm > 1.0e-6
             ? G_m_s2 / p_imu->IMU_mean_acc_norm
             : 1.0;
-    adaptive_window_bridge->ProcessLidar(
+    const bool solved = adaptive_window_bridge->ProcessLidar(
         lidar_update_timestamp, _state,
         backendImuMeasurements(lidar_update_timestamp), acceleration_scale,
         voxelmap_manager->ptpl_list_, feats_down_size);
+    applyAdaptiveFeedback(lidar_update_timestamp, solved, false);
+    if (solved && adaptive_window_bridge->feedback_enabled())
+    {
+      lidar_keyframe_id = adaptive_window_bridge->FrameIdAt(lidar_update_timestamp);
+      lidar_keyframe = lidar_keyframe_id != 0;
+      if (lidar_keyframe) ++lidar_keyframes_;
+    }
   }
 
   double t2 = omp_get_wtime();
@@ -468,9 +603,15 @@ void LIVMapper::handleLIO()
           (-point_crossmat) * _state.cov.block<3, 3>(0, 0) * (-point_crossmat).transpose() + _state.cov.block<3, 3>(3, 3);
     voxelmap_manager->pv_list_[i].var = var;
   }
-  voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_);
-  std::cout << "[ LIO ] Update Voxel Map" << std::endl;
-  _pv_list = voxelmap_manager->pv_list_;
+  if (!voxelmap_manager->feedback_mapping_enabled() || lidar_keyframe)
+  {
+    voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_,
+                                     lidar_update_timestamp, lidar_keyframe_id);
+    ROS_INFO_STREAM_THROTTLE(5.0, "Map keyframes lidar=" << lidar_keyframes_
+        << " visual=" << visual_keyframes_ << " retired_scans="
+        << retired_lidar_scans_ << " active_scans="
+        << voxelmap_manager->active_scan_count());
+  }
   
   double t4 = omp_get_wtime();
 
@@ -488,6 +629,7 @@ void LIVMapper::handleLIO()
     RGBpointBodyToWorld(&laserCloudFullRes->points[i], &laserCloudWorld->points[i]);
   }
   *pcl_w_wait_pub = *laserCloudWorld;
+  last_lidar_scan_time_ = lidar_update_timestamp;
 
   publish_frame_world(pubLaserCloudFullRes, vio_manager);
   if (pub_effect_point_en) publish_effect_world(pubLaserCloudEffect, voxelmap_manager->ptpl_list_);
@@ -1223,13 +1365,29 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
 
   /*** Publish Frame ***/
   sensor_msgs::PointCloud2 laserCloudmsg;
-  if (slam_mode_ == LIVO && LidarMeasures.lio_vio_flg == VIO)
+  if (slam_mode_ == LIVO)
   {
+    // The visual update colors points inside the camera field of view. LiDAR
+    // updates and images with no valid projections still need a real cloud for
+    // RViz; otherwise /cloud_registered alternates with empty messages.
+    if (laserCloudWorldRGB->empty())
+    {
+      laserCloudWorldRGB->reserve(pcl_w_wait_pub->points.size());
+      for (const auto &point : pcl_w_wait_pub->points)
+      {
+        PointTypeRGB fallback;
+        fallback.x = point.x;
+        fallback.y = point.y;
+        fallback.z = point.z;
+        fallback.r = fallback.g = fallback.b = 190;
+        laserCloudWorldRGB->push_back(fallback);
+      }
+    }
     pcl::toROSMsg(*laserCloudWorldRGB, laserCloudmsg);
   }
-  if (slam_mode_ == ONLY_LIO || slam_mode_ == ONLY_LO)
-  { 
-    pcl::toROSMsg(*pcl_w_wait_pub, laserCloudmsg); 
+  else if (slam_mode_ == ONLY_LIO || slam_mode_ == ONLY_LO)
+  {
+    pcl::toROSMsg(*pcl_w_wait_pub, laserCloudmsg);
   }
   laserCloudmsg.header.stamp = ros::Time::now(); //.fromSec(last_timestamp_lidar);
   laserCloudmsg.header.frame_id = "camera_init";
