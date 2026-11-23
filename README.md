@@ -96,11 +96,12 @@ git clone https://github.com/xuankuzcr/rpg_vikit.git
 Clone the repository and catkin_make:
 
 ```
+# Use a workspace that does not already contain another fast_livo package.
 cd ~/catkin_ws/src
-git clone https://github.com/hku-mars/FAST-LIVO2
-cd ../
+git clone --single-branch --branch feature/gs-livo-adaptive-map https://github.com/xiaofafafafa/FAST-LIVO2.git LVI-ASW-GS
+cd ..
 catkin_make
-source ~/catkin_ws/devel/setup.bash
+source devel/setup.bash
 ```
 
 ## 4. Run our examples

@@ -79,6 +79,8 @@ python3 -m gs_mapping /tmp/gs_example_01 --config config/gaussian_window.json --
 
 示例用 9 次激光、8 张异步图像；每隔 3 张留出 1 张，应该有 6 张进入候选、2 张用于评估，`gaussians_000.ply` 非空。CPU 参考实现不依赖显卡。图像由已知合成场景生成，仅验证实现行为。带 Eigen3、Ceres、CMake 的环境运行 `sh scripts/check_gaussian_window.sh` 可同时执行独立 C++ 测试，其中包括已知高斯先验的位姿边际协方差检查。
 
+实际验证记录：[Ubuntu 22.04 / Ceres 2.0 的构建与测试](https://github.com/xiaofafafafa/FAST-LIVO2/actions/runs/45193203110) 通过了 8 个 Python CPU 检查和独立 Ceres 测试程序。用上述合成回放导出过 24 个高斯；一组自适应运行的实际窗长为 1、2、3、4、4、4。没有使用真实 rosbag，也没有在该运行机上测试 CUDA。同步录制和真实 GPU 吞吐须另测。
+
 ## 4. 用自己的 rosbag 和 GS-LIVO 光栅器
 
 1. 按原项目配置好 ROS1/catkin、驱动、vikit、OpenCV、Eigen、Ceres 并重新构建（新增 `gaussian_journal.cpp`）。选择与传感器匹配的原有标定。新 launch 支持 `profile:=avia` 和 `profile:=ntu`，故意启用上传版中的状态／活动地图修正。其它装置请在自己的 launch 设置同名参数，不能套用示例外参。
