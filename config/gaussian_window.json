@@ -1,0 +1,10 @@
+{
+  "max_gap": 0.65, "pair_dt": 0.09, "history": 2.0,
+  "max_frames": 4, "max_candidates": 12, "max_pairs": 256,
+  "max_active": 128, "max_map": 12000, "max_work": 600,
+  "budget_ms": 100.0, "iterations": 2, "gain_min": 0.12, "splat_gain": 0.035,
+  "voxel": 0.16, "block": 0.8, "radius": 0.095, "thickness": 0.025,
+  "plane_sigma": 0.025, "pixel_sigma": 1.5, "pose_sigma_m": 0.12,
+  "pose_sigma_deg": 4.0, "coverage": 0.08, "learn_shape": true, "use_pose_uncertainty": true,
+  "fixed_frames": false, "fixed_splats": false, "fixed": false
+}

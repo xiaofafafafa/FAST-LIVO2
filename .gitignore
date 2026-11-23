@@ -1,3 +1,5 @@
 Log/*
 build/*
 build-aw/
+__pycache__/
+*.py[cod]

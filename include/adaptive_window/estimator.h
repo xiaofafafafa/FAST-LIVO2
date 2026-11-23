@@ -19,6 +19,10 @@ class Estimator {
   Estimator &operator=(const Estimator &) = delete;
   void setParameter(const LidarExtrinsic &, const ExtrinsicState &, ProjectionFunction = {});
   void clearState();
+  void enableMappingSnapshots(bool marginal_covariance) {
+    snapshot_enabled_ = true; covariance_enabled_ = marginal_covariance;
+  }
+  const std::vector<MappingPose>& mappingSnapshot() const { return mapping_snapshot_; }
   void processIMU(const ImuSampleVector &);
   bool processLidar(const NavState &, const MeasurementSummary &, const LidarPlaneObservationVector &);
   bool processImage(const NavState &, const MeasurementSummary &, const VisualPatchObservationVector &,
@@ -74,6 +78,8 @@ class Estimator {
   void recover();
   Eigen::Matrix<double, kPoseDim, kPoseDim> directionalPriorSqrt(double timestamp) const;
 
+  bool snapshot_enabled_ = false, covariance_enabled_ = false;
+  std::vector<MappingPose> mapping_snapshot_;
   AdaptiveWindowConfig config_;
   InformationEvaluator information_evaluator_;
   AdaptivePolicy policy_;

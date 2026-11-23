@@ -1,4 +1,5 @@
 #include "adaptive_window/fast_livo_bridge.h"
+#include "adaptive_window/gaussian_journal.h"
 
 #include "adaptive_window/math_utils.h"
 
@@ -263,6 +264,16 @@ FastLivoBridge::FastLivoBridge(ros::NodeHandle &node_handle,
   backend_->Initialize(lidar_extrinsic_, camera_extrinsic_initial_,
                        std::move(projection));
 
+  std::string journal_dir;
+  node_handle.param<std::string>("gaussian_mapping/journal_dir", journal_dir, "");
+  if (!journal_dir.empty()) {
+    bool cov = true;
+    node_handle.param("gaussian_mapping/marginal_covariance", cov, true);
+    gaussian_journal_.reset(new GaussianJournal(journal_dir));
+    if (gaussian_journal_->good()) backend_->enableMappingSnapshots(cov);
+    else gaussian_journal_.reset();
+  }
+
   odometry_publisher_ = node_handle.advertise<nav_msgs::Odometry>(
       "/adaptive_window/odometry", 20);
   optimized_odometry_publisher_ = node_handle.advertise<nav_msgs::Odometry>(
@@ -477,6 +488,7 @@ bool FastLivoBridge::ProcessLidar(
     const std::size_t raw_feature_count)
 {
   if (!enabled()) return false;
+  if (gaussian_journal_) gaussian_journal_->scan(timestamp, state, lidar_extrinsic_, planes);
   ImuSampleVector samples;
   samples.reserve(imu_messages.size());
   for (const auto &message : imu_messages)
@@ -505,6 +517,7 @@ bool FastLivoBridge::ProcessLidar(
       timestamp, state, planes, raw_feature_count, &observations);
   const bool result = backend_->ProcessLidar(
       candidate, summary, observations);
+  if (gaussian_journal_) gaussian_journal_->solution(*backend_, result);
   Publish(timestamp, result, Modality::kLidar);
   return result;
 }
@@ -517,6 +530,7 @@ bool FastLivoBridge::ProcessVision(const double timestamp,
                                    const double acceleration_scale)
 {
   if (!enabled()) return false;
+  if (gaussian_journal_) gaussian_journal_->image(timestamp, vio_manager);
   ImuSampleVector samples;
   samples.reserve(imu_messages.size());
   for (const auto &message : imu_messages)
@@ -566,6 +580,7 @@ bool FastLivoBridge::ProcessVision(const double timestamp,
       };
   const bool result = backend_->ProcessVision(
       candidate, summary, observations, image_sampler);
+  if (gaussian_journal_) gaussian_journal_->solution(*backend_, result);
   Publish(timestamp, result, Modality::kVision);
   return result;
 }

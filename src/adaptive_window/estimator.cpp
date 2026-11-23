@@ -1,5 +1,6 @@
 #include "adaptive_window/estimator.h"
 #include <Eigen/Eigenvalues>
+#include <ceres/covariance.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -74,6 +75,7 @@ void Estimator::setParameter(const LidarExtrinsic &l, const ExtrinsicState &e, P
   lidar_extrinsic_ = l; camera_extrinsic_initial_ = e; projection_ = std::move(p); clearState();
 }
 void Estimator::clearState() {
+  mapping_snapshot_.clear();
   pending_imu_.clear(); lidar_frames_.clear(); retired_frames_.clear(); patches_.clear(); associator_.Clear();
   information_evaluator_ = InformationEvaluator(config_); policy_ = AdaptivePolicy(config_);
   has_lidar_ = false; has_vision_ = false; latest_node_ = 0;
@@ -687,6 +689,26 @@ bool Estimator::optimization(double *final_cost) {
     return false;
   }
   double2vector(); solver_flag = NON_LINEAR;
+  if (snapshot_enabled_) {
+    // Take the final pose of every node *before* slideWindow can delete it.
+    // These are diagonal marginal blocks of the joint problem, not inverse
+    // pose-only Hessians. A rank failure is explicit; it is not zero noise.
+    mapping_snapshot_.clear();
+    ceres::Covariance::Options opt;
+    opt.algorithm_type = ceres::DENSE_SVD;
+    opt.null_space_rank = 0;
+    ceres::Covariance covariance(opt);
+    std::vector<std::pair<const double*, const double*>> blocks;
+    for (const auto& p : para_Pose) blocks.emplace_back(p.second, p.second);
+    const bool available = covariance_enabled_ && covariance.Compute(blocks, &problem);
+    for (const auto& p : para_Pose) {
+      MappingPose f; f.id = p.first; f.state = stateEstimate(f.id);
+      Eigen::Matrix<double,6,6,Eigen::RowMajor> cov;
+      if (available && covariance.GetCovarianceBlockInTangentSpace(p.second, p.second, cov.data())
+          && cov.allFinite()) { f.covariance = cov; f.covariance_valid = true; }
+      mapping_snapshot_.push_back(f);
+    }
+  }
   if (final_cost) *final_cost = summary.final_cost;
   return true;
 }

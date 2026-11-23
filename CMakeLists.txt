@@ -139,6 +139,7 @@ add_library(imu_proc src/IMU_Processing.cpp)
 add_library(laser_mapping
   src/LIVMapper.cpp
   src/adaptive_window/fast_livo_bridge.cpp
+  src/adaptive_window/gaussian_journal.cpp
 )
 target_link_libraries(laser_mapping adaptive_window_core ${catkin_LIBRARIES})
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

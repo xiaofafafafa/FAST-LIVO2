@@ -1,0 +1,17 @@
+<launch>
+  <!-- Existing parent required; last component must be new for each run. -->
+  <arg name="journal_dir" />
+  <arg name="profile" default="avia" doc="avia or ntu; other sensors use their calibrated launch and the same two parameters" />
+  <arg name="marginal_covariance" default="true" />
+  <arg name="rviz" default="false" />
+  <param name="gaussian_mapping/journal_dir" value="$(arg journal_dir)" type="str" />
+  <param name="gaussian_mapping/marginal_covariance" value="$(arg marginal_covariance)" type="bool" />
+  <include if="$(eval arg('profile') == 'avia')" file="$(find fast_livo)/launch/mapping_avia_adaptive.launch">
+    <arg name="rviz" value="$(arg rviz)" />
+    <arg name="feedback" value="true" />
+  </include>
+  <include if="$(eval arg('profile') == 'ntu')" file="$(find fast_livo)/launch/mapping_ouster_ntu_adaptive.launch">
+    <arg name="rviz" value="$(arg rviz)" />
+    <arg name="feedback_enabled" value="true" />
+  </include>
+</launch>

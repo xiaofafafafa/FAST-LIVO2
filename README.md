@@ -1,20 +1,12 @@
-# FAST-LIVO2
+# LVI-ASW + adaptive Gaussian mapping
 
-> This workspace also contains an optional information-driven adaptive
-> **Ceres 2.1+** fixed-lag backend under `include/adaptive_window/` and
-> `src/adaptive_window/`. See
-> [`docs/ADAPTIVE_WINDOW_INTEGRATION.md`](docs/ADAPTIVE_WINDOW_INTEGRATION.md)
-> and launch it with `mapping_avia_adaptive.launch`. The original launch files
-> remain unchanged and the extension is disabled unless its YAML is loaded.
-> This research branch has **not yet been compiled or dataset-validated**.
-> It runs in shadow mode (no state/covariance/map feedback). Start with the
-> standalone tests in the integration guide before running ROS datasets.
-> The backend now follows VINS-style `Estimator` / `factor/` naming and includes
-> configurable regularization around FAST-LIVO2 filter poses. See
-> [`docs/VINS_STYLE_BACKEND.md`](docs/VINS_STYLE_BACKEND.md) for the code map.
-> 详细中文注释与框架说明见
-> [`docs/ADAPTIVE_WINDOW_CODE_GUIDE_CN.md`](docs/ADAPTIVE_WINDOW_CODE_GUIDE_CN.md)，
-> 包含文件职责、调用流程、状态布局、各类因子、边缘化和配置诊断。
+从上传的 LVI-ASW 源码接入 GS-LIVO 的 3D 高斯渲染器。位姿来自同一套 Ceres 状态滑窗，
+独立的建图窗负责选帧、选择活跃高斯和维护地图。入口：[中文算法、数据流与运行指南](docs/GAUSSIAN_WINDOW_CN.md)。
+
+状态估计复用了上传版中已有的激光、视觉、预积分、边缘化与活动地图修正；
+新增的 GS 接口默认关闭，使用 `mapping_gaussian_adaptive.launch` 启用。
+先尝试 `python3 -m gs_mapping.demo /tmp/gs_demo_01`，
+再运行 `python3 -m gs_mapping /tmp/gs_demo_01 --out /tmp/gs_map_01`。
 
 ## FAST-LIVO2: Fast, Direct LiDAR-Inertial-Visual Odometry
 

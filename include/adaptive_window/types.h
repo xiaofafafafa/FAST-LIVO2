@@ -67,6 +67,14 @@ struct RetiredFrame
   NavState frontend;
 };
 
+// Accepted pre-marginalization snapshot for asynchronous Gaussian mapping.
+struct MappingPose {
+  std::uint64_t id = 0;
+  NavState state;
+  Eigen::Matrix<double,6,6> covariance = Eigen::Matrix<double,6,6>::Zero();
+  bool covariance_valid = false;
+};
+
 struct ExtrinsicState
 {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW

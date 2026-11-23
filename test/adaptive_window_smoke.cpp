@@ -263,6 +263,20 @@ void TestBackend(bool asynchronous) {
   Require(backend.diagnostics().rejected_imu_intervals == 1, "IMU rejection diagnostic");
 }
 
+void TestMappingCovariance() {
+  AdaptiveWindowConfig c; c.solver_time_limit=1; c.frontend_pose_prior_enabled=false;
+  Estimator e(c); e.enableMappingSnapshots(true);
+  NavState state; state.timestamp=0.3;
+  const auto id=e.addFrame(state);
+  Require(e.addResidualBlock(FactorFactory::initialState(id,state,c)), "full rank mapping prior");
+  Require(e.solveOdometry(), "accepted snapshot solve");
+  const auto& s=e.mappingSnapshot();
+  Require(s.size()==1 && s[0].id==id && s[0].covariance_valid, "valid 6D marginal");
+  Require(std::abs(s[0].covariance(0,0)-c.pose_prior_translation_sigma*c.pose_prior_translation_sigma)<1e-6,
+          "position marginal agrees with known Gaussian prior");
+  e.clearState();
+  Require(e.mappingSnapshot().empty(), "reset invalidates previous snapshot");
+}
 void TestFrontendPoseRefinement() {
   AdaptiveWindowConfig c; c.solver_time_limit = 1;
   Estimator estimator(c);
@@ -450,7 +464,7 @@ void TestDistinctPosePlaneTie() {
 }
 int main() {
   try {
-    TestManifold(); TestPreintegrationAndFactors(); TestMarginalization(); TestFrontendPoseRefinement();
+    TestManifold(); TestPreintegrationAndFactors(); TestMarginalization(); TestMappingCovariance(); TestFrontendPoseRefinement();
     TestNormalizedInformationPolicy();
     TestDirectionalPriorAndAnchorChoice();
     TestDistinctPosePlaneTie();

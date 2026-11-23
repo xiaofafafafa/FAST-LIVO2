@@ -25,6 +25,8 @@ namespace fast_livo
 namespace adaptive_window
 {
 
+class GaussianJournal;
+
 class FastLivoBridge
 {
 public:
@@ -80,6 +82,7 @@ private:
   void RecordOptimizedPose(const NavState &estimate);
   void FlushPendingPose();
 
+  std::unique_ptr<GaussianJournal> gaussian_journal_;
   AdaptiveWindowConfig config_;
   LidarExtrinsic lidar_extrinsic_;
   ExtrinsicState camera_extrinsic_initial_;
